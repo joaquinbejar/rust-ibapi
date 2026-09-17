@@ -191,8 +191,13 @@ pub struct Position {
     pub contract: Contract,
     /// Number of shares held
     pub position: f64,
-    /// Average cost of shares
-    pub average_cost: f64,
+    /// Average cost of shares, when the message carried one.
+    ///
+    /// `None` when the server did not report it: a version 1 or 2 text
+    /// message, or a protobuf message without the field. That is not the same
+    /// as an average cost of zero, and a consumer that needs the cost must not
+    /// read `None` as one.
+    pub average_cost: Option<f64>,
 }
 
 /// Messages emitted while streaming position updates.

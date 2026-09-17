@@ -31,7 +31,7 @@ fn test_decode_positions() {
     assert_eq!(position.contract.local_symbol, "TSLA", "position.contract.local_symbol");
     assert_eq!(position.contract.trading_class, "NMS", "position.contract.trading_class");
     assert_eq!(position.position, 500.0, "position.position");
-    assert_eq!(position.average_cost, 196.77, "position.average_cost");
+    assert_eq!(position.average_cost, Some(196.77), "position.average_cost");
 }
 
 #[test]
@@ -65,7 +65,7 @@ fn test_decode_position_v1_message() {
     assert_eq!(result.contract.local_symbol, "LOCSYM", "contract.local_symbol");
     assert_eq!(result.position, 100.0, "position");
     assert_eq!(result.contract.trading_class, "", "contract.trading_class should be empty for v1");
-    assert_eq!(result.average_cost, 0.0, "average_cost should be 0.0 for v1");
+    assert_eq!(result.average_cost, None, "a v1 message carries no average cost");
 }
 
 #[test]
@@ -100,7 +100,7 @@ fn test_decode_position_v2_message() {
     assert_eq!(result.contract.local_symbol, "LOCSYM", "contract.local_symbol");
     assert_eq!(result.contract.trading_class, "TRDCLS", "contract.trading_class");
     assert_eq!(result.position, 100.0, "position");
-    assert_eq!(result.average_cost, 0.0, "average_cost should be 0.0 for v2");
+    assert_eq!(result.average_cost, None, "a v2 message carries no average cost");
 }
 
 #[test]
@@ -894,7 +894,71 @@ fn test_decode_position_proto() {
     assert_eq!(result.contract.contract_id, 265598);
     assert_eq!(result.contract.symbol.to_string(), "AAPL");
     assert_eq!(result.position, 100.0);
-    assert_eq!(result.average_cost, 150.25);
+    assert_eq!(result.average_cost, Some(150.25));
+}
+
+#[test]
+fn test_decode_position_proto_without_a_quantity_is_an_error() {
+    use prost::Message;
+
+    // Field 3 omitted. Before this decoder required it, the row decoded as a
+    // flat position with `position == 0.0`, which a consumer cannot tell apart
+    // from a reported zero.
+    let proto_msg = crate::proto::Position {
+        account: Some("DU1234".into()),
+        contract: Some(crate::proto::Contract {
+            con_id: Some(265598),
+            ..Default::default()
+        }),
+        position: None,
+        avg_cost: Some(12.25),
+    };
+    let mut bytes = Vec::new();
+    proto_msg.encode(&mut bytes).unwrap();
+
+    let error = super::decode_position_proto(&bytes).expect_err("an absent quantity decoded");
+    assert!(error.to_string().contains("position is not present"), "{error}");
+}
+
+#[test]
+fn test_decode_position_proto_with_a_garbled_quantity_is_an_error() {
+    use prost::Message;
+
+    let proto_msg = crate::proto::Position {
+        account: Some("DU1234".into()),
+        contract: Some(crate::proto::Contract {
+            con_id: Some(265598),
+            ..Default::default()
+        }),
+        position: Some("garbled".into()),
+        avg_cost: Some(12.25),
+    };
+    let mut bytes = Vec::new();
+    proto_msg.encode(&mut bytes).unwrap();
+
+    let error = super::decode_position_proto(&bytes).expect_err("a garbled quantity decoded");
+    assert!(error.to_string().contains("position is not a number"), "{error}");
+}
+
+#[test]
+fn test_decode_position_proto_keeps_a_reported_zero_and_an_absent_average_cost() {
+    use prost::Message;
+
+    let proto_msg = crate::proto::Position {
+        account: Some("DU1234".into()),
+        contract: Some(crate::proto::Contract {
+            con_id: Some(265598),
+            ..Default::default()
+        }),
+        position: Some("0".into()),
+        avg_cost: None,
+    };
+    let mut bytes = Vec::new();
+    proto_msg.encode(&mut bytes).unwrap();
+
+    let result = super::decode_position_proto(&bytes).unwrap();
+    assert_eq!(result.position, 0.0, "a reported zero is a flat position");
+    assert_eq!(result.average_cost, None, "an absent average cost is not zero");
 }
 
 #[test]
@@ -918,7 +982,7 @@ fn test_decode_position_proto_round_trips_via_builder() {
     assert_eq!(result.contract.symbol.to_string(), "AAPL");
     assert_eq!(result.contract.exchange.to_string(), "SMART");
     assert_eq!(result.position, 100.0);
-    assert_eq!(result.average_cost, 150.25);
+    assert_eq!(result.average_cost, Some(150.25));
 }
 
 #[test]

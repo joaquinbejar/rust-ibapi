@@ -26,7 +26,7 @@ fn main() {
         match position_update {
             PositionUpdate::Position(position) => {
                 println!(
-                    "{:4} {:4} {} @ {}",
+                    "{:4} {:4} {} @ {:?}",
                     position.position, position.contract.symbol, position.contract.contract_id, position.average_cost
                 )
             }

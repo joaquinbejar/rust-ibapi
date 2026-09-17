@@ -20,6 +20,22 @@ pub(crate) fn parse_f64(opt: &Option<String>) -> f64 {
     opt.as_deref().and_then(|s| s.parse::<f64>().ok()).unwrap_or_default()
 }
 
+/// A numeric string field that the message must carry.
+///
+/// `parse_f64` answers `0.0` for an absent field and for one that does not
+/// parse, which makes both indistinguishable from a reported zero. For a
+/// position quantity that difference is the whole meaning of the row: a
+/// consumer that sees `0.0` concludes the position is flat. This helper keeps
+/// absence and unparseability as errors so the caller can decide.
+pub(crate) fn required_f64(opt: &Option<String>, field: &str) -> Result<f64, Error> {
+    match opt.as_deref() {
+        None => Err(Error::Parse(0, String::new(), format!("{field} is not present"))),
+        Some(text) => text
+            .parse::<f64>()
+            .map_err(|_| Error::Parse(0, text.to_string(), format!("{field} is not a number"))),
+    }
+}
+
 pub(crate) fn parse_i32(opt: &Option<String>) -> i32 {
     opt.as_deref().and_then(|s| s.parse::<i32>().ok()).unwrap_or_default()
 }
