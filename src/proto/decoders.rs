@@ -30,10 +30,34 @@ pub(crate) fn parse_f64(opt: &Option<String>) -> f64 {
 pub(crate) fn required_f64(opt: &Option<String>, field: &str) -> Result<f64, Error> {
     match opt.as_deref() {
         None => Err(Error::Parse(0, String::new(), format!("{field} is not present"))),
-        Some(text) => text
-            .parse::<f64>()
-            .map_err(|_| Error::Parse(0, text.to_string(), format!("{field} is not a number"))),
+        Some(text) => required_text_f64(text, field),
     }
+}
+
+/// A numeric text field that must carry a number.
+///
+/// The text protocol's `next_double` answers `0.0` for an empty field, which
+/// is right for the many fields IB leaves blank to mean "not applicable" and
+/// wrong for a position quantity, where a blank is not a flat position. This
+/// keeps an empty or unparseable field as an error naming it.
+pub(crate) fn required_text_f64(text: &str, field: &str) -> Result<f64, Error> {
+    if text.is_empty() {
+        return Err(Error::Parse(0, String::new(), format!("{field} is empty")));
+    }
+    text.parse::<f64>()
+        .map_err(|_| Error::Parse(0, text.to_string(), format!("{field} is not a number")))
+}
+
+/// A numeric text field that may be blank.
+///
+/// `None` for an empty field, the number for a numeric one, and an error for
+/// anything else: a blank average cost is a cost IB did not state, and it is
+/// not a cost of zero.
+pub(crate) fn optional_text_f64(text: &str, field: &str) -> Result<Option<f64>, Error> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    required_text_f64(text, field).map(Some)
 }
 
 pub(crate) fn parse_i32(opt: &Option<String>) -> i32 {

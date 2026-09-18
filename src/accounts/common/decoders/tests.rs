@@ -35,6 +35,48 @@ fn test_decode_positions() {
 }
 
 #[test]
+fn test_decode_position_text_with_an_empty_quantity_is_an_error() {
+    // Version 3, quantity field empty. `next_double` would have read it as
+    // `0.0`, a flat position; a blank is not one.
+    let mut message =
+        super::ResponseMessage::from("61\x003\x00DU123\x00123\x00SYM\x00STK\x00\x000.0\x00\x00\x00EXCH\x00USD\x00LOCSYM\x00TRDCLS\x00\x0012.25\x00");
+    let error = super::decode_position(&mut message).expect_err("an empty quantity decoded");
+    assert!(error.to_string().contains("position is empty"), "{error}");
+}
+
+#[test]
+fn test_decode_position_text_with_a_garbled_quantity_is_an_error() {
+    let mut message = super::ResponseMessage::from(
+        "61\x003\x00DU123\x00123\x00SYM\x00STK\x00\x000.0\x00\x00\x00EXCH\x00USD\x00LOCSYM\x00TRDCLS\x00garbled\x0012.25\x00",
+    );
+    let error = super::decode_position(&mut message).expect_err("a garbled quantity decoded");
+    assert!(error.to_string().contains("position is not a number"), "{error}");
+}
+
+#[test]
+fn test_decode_position_text_with_an_empty_average_cost_is_none_and_a_garbled_one_is_an_error() {
+    let mut message =
+        super::ResponseMessage::from("61\x003\x00DU123\x00123\x00SYM\x00STK\x00\x000.0\x00\x00\x00EXCH\x00USD\x00LOCSYM\x00TRDCLS\x002\x00\x00");
+    let result = super::decode_position(&mut message).expect("an empty cost is not an error");
+    assert_eq!(result.position, 2.0);
+    assert_eq!(result.average_cost, None, "a blank cost is not a cost of zero");
+
+    let mut message =
+        super::ResponseMessage::from("61\x003\x00DU123\x00123\x00SYM\x00STK\x00\x000.0\x00\x00\x00EXCH\x00USD\x00LOCSYM\x00TRDCLS\x002\x00abc\x00");
+    let error = super::decode_position(&mut message).expect_err("a garbled cost decoded");
+    assert!(error.to_string().contains("average cost is not a number"), "{error}");
+}
+
+#[test]
+fn test_decode_position_text_keeps_an_explicit_zero_quantity_and_cost() {
+    let mut message =
+        super::ResponseMessage::from("61\x003\x00DU123\x00123\x00SYM\x00STK\x00\x000.0\x00\x00\x00EXCH\x00USD\x00LOCSYM\x00TRDCLS\x000\x000\x00");
+    let result = super::decode_position(&mut message).expect("a reported zero decodes");
+    assert_eq!(result.position, 0.0);
+    assert_eq!(result.average_cost, Some(0.0));
+}
+
+#[test]
 fn test_decode_position_v1_message() {
     // Assemble: version 1, no trading_class, no average_cost
     // Message format: type, version, account, conId, symbol, secType, lastTradeDateOrContractMonth, strike, right, multiplier, exchange, currency, localSymbol, position

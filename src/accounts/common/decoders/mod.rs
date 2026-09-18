@@ -4,7 +4,7 @@ use prost::Message;
 
 use crate::contracts::{Contract, Currency, Exchange, SecurityType, Symbol};
 use crate::messages::ResponseMessage;
-use crate::proto::decoders::{parse_f64 as parse_str_f64, parse_optional, required_f64};
+use crate::proto::decoders::{optional_text_f64, parse_f64 as parse_str_f64, parse_optional, required_f64, required_text_f64};
 use crate::{proto, server_versions, Error};
 
 use super::super::{
@@ -39,10 +39,13 @@ pub(crate) fn decode_position(message: &mut ResponseMessage) -> Result<Position,
             position.contract.trading_class = msg.next_string()?;
         }
 
-        position.position = msg.next_double()?;
+        // Read as text and parsed strictly: `next_double` turns an empty
+        // field into `0.0`, and an empty quantity is not a flat position.
+        // An empty average cost is one IB did not state, kept as `None`.
+        position.position = required_text_f64(&msg.next_string()?, "position")?;
 
         if message_version >= 3 {
-            position.average_cost = Some(msg.next_double()?);
+            position.average_cost = optional_text_f64(&msg.next_string()?, "average cost")?;
         }
 
         Ok(position)
