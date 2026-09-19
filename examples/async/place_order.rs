@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     );
                 }
                 Ok(OrderUpdate::CommissionReport(r)) => {
-                    println!("[Monitor] commission: ${} for {}", r.commission, r.execution_id);
+                    println!("[Monitor] commission: {:?} for {}", r.commission, r.execution_id);
                 }
                 Err(e) => {
                     eprintln!("[Monitor] error: {e:?}");

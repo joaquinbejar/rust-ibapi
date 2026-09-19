@@ -38,7 +38,12 @@ pub(crate) fn decode_open_order_proto(bytes: &[u8]) -> Result<OrderData, Error> 
         .map(crate::proto::decoders::decode_contract)
         .transpose()?
         .unwrap_or_default();
-    let order = p.order.as_ref().map(crate::proto::decoders::decode_order).unwrap_or_default();
+    let order = p
+        .order
+        .as_ref()
+        .map(crate::proto::decoders::decode_order)
+        .transpose()?
+        .unwrap_or_default();
     let order_state = p
         .order_state
         .as_ref()
@@ -100,7 +105,12 @@ pub(crate) fn decode_completed_order_proto(bytes: &[u8]) -> Result<OrderData, Er
         .map(crate::proto::decoders::decode_contract)
         .transpose()?
         .unwrap_or_default();
-    let order = p.order.as_ref().map(crate::proto::decoders::decode_order).unwrap_or_default();
+    let order = p
+        .order
+        .as_ref()
+        .map(crate::proto::decoders::decode_order)
+        .transpose()?
+        .unwrap_or_default();
     let order_state = p
         .order_state
         .as_ref()
@@ -123,7 +133,7 @@ pub(crate) fn decode_commission_report_proto(bytes: &[u8]) -> Result<CommissionR
 
     Ok(CommissionReport {
         execution_id: p.exec_id.unwrap_or_default(),
-        commission: p.commission_and_fees.unwrap_or_default(),
+        commission: p.commission_and_fees,
         currency: p.currency.unwrap_or_default(),
         realized_pnl: crate::proto::decoders::optional_f64(p.realized_pnl),
         yields: crate::proto::decoders::optional_f64(p.bond_yield),

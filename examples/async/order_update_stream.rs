@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 Ok(OrderUpdate::CommissionReport(report)) => {
                     println!("Commission Report:");
                     println!("  Execution ID: {}", report.execution_id);
-                    println!("  Commission: {} {}", report.commission, report.currency);
+                    println!("  Commission: {:?} {}", report.commission, report.currency);
                 }
                 Err(e) => {
                     eprintln!("Error in order stream: {e:?}");

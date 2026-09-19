@@ -176,7 +176,7 @@ pub fn decode_soft_dollar_tier(proto: &proto::SoftDollarTier) -> SoftDollarTier 
     }
 }
 
-pub fn decode_order(proto: &proto::Order) -> Order {
+pub fn decode_order(proto: &proto::Order) -> Result<Order, Error> {
     let mut order = Order::default();
 
     order.client_id = proto.client_id.unwrap_or_default();
@@ -184,7 +184,10 @@ pub fn decode_order(proto: &proto::Order) -> Order {
     order.perm_id = proto.perm_id.unwrap_or_default();
     order.parent_id = proto.parent_id.unwrap_or_default();
 
-    order.action = Action::from(proto.action.as_deref().unwrap_or("BUY"));
+    // Required, and read fallibly: an order without a side is not an order
+    // this reader can describe, and defaulting it to BUY would report a
+    // working sell as a buy. An unknown side is an error, not a panic.
+    order.action = parse_required::<Action>(proto.action.as_deref(), "Order.action")?;
     order.total_quantity = parse_f64(&proto.total_quantity);
     order.display_size = proto.display_size.map(Some).unwrap_or(Some(0));
     order.order_type = s(&proto.order_type);
@@ -364,7 +367,7 @@ pub fn decode_order(proto: &proto::Order) -> Order {
     order.manual_order_indicator = proto.manual_order_indicator;
     order.submitter = s(&proto.submitter);
 
-    order
+    Ok(order)
 }
 
 fn decode_order_condition(proto: &proto::OrderCondition) -> OrderCondition {

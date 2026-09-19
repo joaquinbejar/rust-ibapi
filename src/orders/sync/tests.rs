@@ -120,7 +120,7 @@ fn place_order() {
 
     if let Some(Ok(PlaceOrder::CommissionReport(report))) = notifications.next_data() {
         assert_eq!(report.execution_id, "00025b46.63f8f39c.01.01", "report.execution_id");
-        assert_eq!(report.commission, 1.0, "report.commission");
+        assert_eq!(report.commission, Some(1.0), "report.commission");
         assert_eq!(report.currency, "USD", "report.currency");
     } else {
         assert!(false, "message[6] expected a commission report notification");
@@ -542,7 +542,7 @@ fn order_update_stream() {
 
     if let Some(Ok(OrderUpdate::CommissionReport(report))) = notifications.next_data() {
         assert_eq!(report.execution_id, "00025b46.63f8f39c.01.01", "report.execution_id");
-        assert_eq!(report.commission, 1.0, "report.commission");
+        assert_eq!(report.commission, Some(1.0), "report.commission");
         assert_eq!(report.currency, "USD", "report.currency");
     } else {
         assert!(false, "expected commission report notification");

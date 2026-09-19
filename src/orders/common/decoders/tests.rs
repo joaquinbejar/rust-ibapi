@@ -156,7 +156,7 @@ fn test_decode_commission_report_proto() {
 
     let result = decode_commission_report_proto(&bytes).unwrap();
     assert_eq!(result.execution_id, "exec123");
-    assert_eq!(result.commission, 1.25);
+    assert_eq!(result.commission, Some(1.25));
     assert_eq!(result.currency, "USD");
     assert_eq!(result.realized_pnl, Some(500.0));
     assert_eq!(result.yields, None); // f64::MAX filtered out
@@ -334,7 +334,7 @@ fn test_decode_commission_report_proto_round_trips_via_builder() {
 
     let result = super::decode_commission_report_proto(&bytes).unwrap();
     assert_eq!(result.execution_id, "exec123");
-    assert_eq!(result.commission, 1.25);
+    assert_eq!(result.commission, Some(1.25));
     assert_eq!(result.currency, "USD");
     assert_eq!(result.realized_pnl, Some(500.0));
     assert_eq!(result.yields, None); // f64::MAX is the IBKR sentinel for "unset"
@@ -425,4 +425,83 @@ fn test_decode_order_status_rejects_text_framing() {
         matches!(err, Error::UnexpectedResponse(_)),
         "expected Error::UnexpectedResponse, got {err:?}"
     );
+}
+
+#[test]
+fn test_decode_open_order_without_an_action_is_an_error_not_a_buy() {
+    // An order the broker described without a side. The decoder used to
+    // default it to BUY, so a working sell described this way would have been
+    // reported as a buy.
+    use prost::Message;
+
+    let proto_msg = crate::proto::OpenOrder {
+        order_id: Some(42),
+        contract: Some(crate::proto::Contract {
+            con_id: Some(265598),
+            ..Default::default()
+        }),
+        order: Some(crate::proto::Order {
+            order_id: Some(42),
+            action: None,
+            total_quantity: Some("100".into()),
+            ..Default::default()
+        }),
+        order_state: Some(crate::proto::OrderState {
+            status: Some("Submitted".into()),
+            ..Default::default()
+        }),
+    };
+    let mut bytes = Vec::new();
+    proto_msg.encode(&mut bytes).unwrap();
+
+    let result = decode_open_order_proto(&bytes);
+    assert!(result.is_err(), "an order without a side decoded as {:?}", result.map(|o| o.order.action));
+}
+
+#[test]
+fn test_decode_open_order_with_an_unknown_action_is_an_error_not_a_panic() {
+    use prost::Message;
+
+    let proto_msg = crate::proto::OpenOrder {
+        order_id: Some(42),
+        order: Some(crate::proto::Order {
+            order_id: Some(42),
+            action: Some("HOLD".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut bytes = Vec::new();
+    proto_msg.encode(&mut bytes).unwrap();
+
+    assert!(decode_open_order_proto(&bytes).is_err());
+}
+
+#[test]
+fn test_decode_commission_report_without_a_commission_is_none_not_zero() {
+    // A fee that was not reported and a fee of nothing are different facts,
+    // and only the second may be added to a total.
+    use prost::Message;
+
+    let absent = crate::proto::CommissionAndFeesReport {
+        exec_id: Some("0001.01".into()),
+        commission_and_fees: None,
+        currency: Some("USD".into()),
+        ..Default::default()
+    };
+    let mut bytes = Vec::new();
+    absent.encode(&mut bytes).unwrap();
+    let result = decode_commission_report_proto(&bytes).unwrap();
+    assert_eq!(result.commission, None);
+
+    let zero = crate::proto::CommissionAndFeesReport {
+        exec_id: Some("0001.01".into()),
+        commission_and_fees: Some(0.0),
+        currency: Some("USD".into()),
+        ..Default::default()
+    };
+    let mut bytes = Vec::new();
+    zero.encode(&mut bytes).unwrap();
+    let result = decode_commission_report_proto(&bytes).unwrap();
+    assert_eq!(result.commission, Some(0.0));
 }

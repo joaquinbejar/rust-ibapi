@@ -398,7 +398,7 @@ impl Client {
     ///                 exec.execution.exchange);
     ///         },
     ///         OrderUpdate::CommissionReport(report) => {
-    ///             println!("Commission: ${} for execution {}",
+    ///             println!("Commission: {:?} for execution {}",
     ///                 report.commission, report.execution_id);
     ///         },
     ///     }

@@ -690,14 +690,34 @@ impl Action {
     }
 
     /// Parse an action from the TWS string identifier.
+    ///
+    /// # Panics
+    /// On a string TWS never sends. A decoder reading the wire uses the
+    /// [`FromStr`](std::str::FromStr) implementation instead, which returns an
+    /// error, because a message from the broker is not a place to panic.
     pub fn from(name: &str) -> Self {
-        match name {
-            "BUY" => Self::Buy,
-            "SELL" => Self::Sell,
-            "SSHORT" => Self::SellShort,
-            "SLONG" => Self::SellLong,
-            &_ => todo!(),
+        match name.parse() {
+            Ok(action) => action,
+            Err(_) => panic!("unknown action {name:?}"),
         }
+    }
+
+    fn from_wire(name: &str) -> Option<Self> {
+        match name {
+            "BUY" => Some(Self::Buy),
+            "SELL" => Some(Self::Sell),
+            "SSHORT" => Some(Self::SellShort),
+            "SLONG" => Some(Self::SellLong),
+            _ => None,
+        }
+    }
+}
+
+impl std::str::FromStr for Action {
+    type Err = crate::Error;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::from_wire(name).ok_or_else(|| crate::Error::Parse(0, name.to_string(), "unknown Action".into()))
     }
 }
 
@@ -1410,7 +1430,12 @@ pub struct CommissionReport {
     /// the execution's id this commission belongs to.
     pub execution_id: String,
     /// the commissions cost.
-    pub commission: f64,
+    /// The commission and fees, when the report carried them.
+    ///
+    /// `None` is a report without the field. It is not a commission of zero:
+    /// a fee that was not reported and a fee of nothing are different facts,
+    /// and only the second may be added to a total.
+    pub commission: Option<f64>,
     /// the reporting currency.
     pub currency: String,
     /// the realized profit and loss

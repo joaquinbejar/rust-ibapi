@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                         OrderUpdate::CommissionReport(report) => {
-                            println!("[Monitor] Commission: ${} for execution {}", report.commission, report.execution_id);
+                            println!("[Monitor] Commission: {:?} for execution {}", report.commission, report.execution_id);
                         }
                     }
                 }
