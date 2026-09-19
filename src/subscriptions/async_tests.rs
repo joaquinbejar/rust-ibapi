@@ -193,6 +193,73 @@ async fn test_subscription_next_end_of_stream() {
 }
 
 #[tokio::test]
+async fn test_completed_is_true_only_after_the_end_marker() {
+    // The end marker and a closed channel both end the stream with `None`.
+    // `completed()` is what tells them apart: a caller reading open orders or
+    // executions gets an empty result either way, and only one of the two
+    // means the broker confirmed there was nothing.
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (tx, rx) = broadcast::channel(100);
+    let internal = AsyncInternalSubscription::new(rx);
+
+    let mut subscription: Subscription<String> = Subscription::with_decoder(
+        internal,
+        message_bus,
+        |_context, _msg| Err(Error::EndOfStream),
+        None,
+        None,
+        DecoderContext::default(),
+    );
+    assert!(!subscription.completed(), "nothing has ended yet");
+
+    tx.send(ResponseMessage::from("test\0").into()).unwrap();
+    assert!(subscription.next().await.is_none());
+    assert!(subscription.completed(), "the decoder saw the end marker");
+}
+
+#[tokio::test]
+async fn test_completed_is_false_when_the_channel_closes_without_a_marker() {
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (tx, rx) = broadcast::channel::<crate::subscriptions::common::RoutedItem>(100);
+    let internal = AsyncInternalSubscription::new(rx);
+
+    let mut subscription: Subscription<String> = Subscription::with_decoder(
+        internal,
+        message_bus,
+        |_context, _msg| Err(Error::EndOfStream),
+        None,
+        None,
+        DecoderContext::default(),
+    );
+
+    // The connection goes away before the broker answers.
+    drop(tx);
+    assert!(subscription.next().await.is_none());
+    assert!(!subscription.completed(), "a closed channel was reported as the broker's own end marker");
+}
+
+#[tokio::test]
+async fn test_completed_is_false_after_a_terminal_error() {
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (tx, rx) = broadcast::channel(100);
+    let internal = AsyncInternalSubscription::new(rx);
+
+    let mut subscription: Subscription<String> = Subscription::with_decoder(
+        internal,
+        message_bus,
+        |_context, _msg| Err(Error::Simple("decode failed".to_string())),
+        None,
+        None,
+        DecoderContext::default(),
+    );
+
+    tx.send(ResponseMessage::from("test\0").into()).unwrap();
+    assert!(matches!(subscription.next().await, Some(Err(_))));
+    assert!(subscription.next().await.is_none());
+    assert!(!subscription.completed());
+}
+
+#[tokio::test]
 async fn test_subscription_no_retries_after_end_of_stream() {
     let message_bus = Arc::new(MessageBusStub::default());
     let (tx, rx) = broadcast::channel(100);

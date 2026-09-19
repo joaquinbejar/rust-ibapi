@@ -81,6 +81,9 @@ pub struct Subscription<T> {
     /// Per-clone — each clone has its own `BroadcastStream` position, so a terminal event
     /// on one clone must not short-circuit other clones' polls.
     stream_ended: AtomicBool,
+    /// Per-clone — whether the stream ended because the decoder saw the broker's
+    /// own end marker, as opposed to the channel closing or an error.
+    completed: AtomicBool,
     message_bus: Option<Arc<dyn AsyncMessageBus>>,
     /// Cancel message generator
     cancel_fn: Option<Arc<CancelFn>>,
@@ -122,6 +125,7 @@ impl<T> Clone for Subscription<T> {
             cancelled: self.cancelled.clone(),
             // Clone gets a fresh stream_ended — independent BroadcastStream position.
             stream_ended: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
             message_bus: self.message_bus.clone(),
             cancel_fn: self.cancel_fn.clone(),
         }
@@ -155,6 +159,7 @@ impl<T> Subscription<T> {
             context,
             cancelled: Arc::new(AtomicBool::new(false)),
             stream_ended: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
             message_bus: Some(message_bus),
             cancel_fn: None,
         }
@@ -202,6 +207,7 @@ impl<T> Subscription<T> {
             context: DecoderContext::default(),
             cancelled: Arc::new(AtomicBool::new(false)),
             stream_ended: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
             message_bus: None,
             cancel_fn: None,
         }
@@ -210,6 +216,23 @@ impl<T> Subscription<T> {
     /// Get the request ID associated with this subscription
     pub fn request_id(&self) -> Option<i32> {
         self.request_id
+    }
+
+    /// Whether the stream ended because the broker sent its end marker.
+    ///
+    /// Several request kinds (`reqOpenOrders`, `reqExecutions`,
+    /// `reqSecDefOptParams`, historical news) finish with a dedicated end
+    /// message that this subscription turns into the end of the stream. A
+    /// stream can also end because the channel closed or an error was
+    /// returned, and a caller that reads `None` cannot tell the two apart:
+    /// an empty result then looks the same whether the broker confirmed
+    /// there was nothing or the connection went away before it answered.
+    ///
+    /// `true` only after `next()` has returned `None` **and** the decoder saw
+    /// the end marker. `false` while the stream is still open, after a
+    /// terminal error, and after the channel closed without a marker.
+    pub fn completed(&self) -> bool {
+        self.completed.load(Ordering::Relaxed)
     }
 }
 
@@ -230,6 +253,7 @@ impl<T: Send + 'static> Stream for Subscription<T> {
             inner,
             context,
             stream_ended,
+            completed,
             ..
         } = this;
         loop {
@@ -251,6 +275,7 @@ impl<T: Send + 'static> Stream for Subscription<T> {
                             match process_decode_result(result) {
                                 ProcessingResult::Success(val) => return Poll::Ready(Some(Ok(SubscriptionItem::Data(val)))),
                                 ProcessingResult::EndOfStream => {
+                                    completed.store(true, Ordering::Relaxed);
                                     stream_ended.store(true, Ordering::Relaxed);
                                     return Poll::Ready(None);
                                 }
