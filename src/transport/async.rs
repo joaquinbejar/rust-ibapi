@@ -223,6 +223,9 @@ pub struct AsyncTcpMessageBus<S: AsyncStream = AsyncTcpSocket> {
     /// Notification to wake the message loop on shutdown
     shutdown_notify: Arc<Notify>,
     connected: Arc<AtomicBool>,
+    /// Whether a socket error is answered by reconnecting in place (the
+    /// default) or by shutting down and letting the caller decide.
+    auto_reconnect: Arc<AtomicBool>,
 }
 
 impl<S: AsyncStream> Drop for AsyncTcpMessageBus<S> {
@@ -266,6 +269,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             connected: Arc::new(AtomicBool::new(true)),
+            auto_reconnect: Arc::new(AtomicBool::new(true)),
         };
 
         // Start cleanup task
@@ -304,6 +308,12 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         Ok(message_bus)
     }
 
+    /// Answer a socket error by shutting down instead of reconnecting in
+    /// place. See `ClientBuilder::auto_reconnect`.
+    pub(crate) fn disable_auto_reconnect(&self) {
+        self.auto_reconnect.store(false, Ordering::Relaxed);
+    }
+
     /// Start processing messages from TWS
     pub fn process_messages(self: Arc<Self>, _server_version: i32, _reconnect_delay: Duration) -> Result<(), Error> {
         let message_bus = self.clone();
@@ -330,6 +340,15 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                                     break;
                                 }
                                 continue;
+                            }
+                            Err(ref err) if is_connection_error(err) && !message_bus.auto_reconnect.load(Ordering::Relaxed) => {
+                                // The caller supervises the connection itself:
+                                // report the failure by ending, rather than
+                                // replaying the handshake behind it.
+                                error!("Connection error detected; auto-reconnect is off, shutting down: {err:?}");
+                                message_bus.connected.store(false, Ordering::Relaxed);
+                                message_bus.request_shutdown().await;
+                                break;
                             }
                             Err(ref err) if is_connection_error(err) => {
                                 error!("Connection error detected, attempting to reconnect: {err:?}");

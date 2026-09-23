@@ -762,3 +762,49 @@ async fn test_send_shared_request_unsupported_returns_error() {
         other => panic!("expected Error::InvalidArgument, got {:?}", other.err()),
     }
 }
+
+/// With auto-reconnect off, a socket failure ends the dispatcher and turns
+/// `is_connected()` false, and no reconnect is attempted: the caller that
+/// supervises the connection learns of the loss instead of the transport
+/// replaying the handshake on the same client id behind it.
+#[tokio::test]
+async fn test_a_socket_failure_without_auto_reconnect_shuts_down_and_does_not_reconnect() {
+    let (stream, bus) = make_bus();
+    stream.set_reconnect_failures(1000);
+    bus.disable_auto_reconnect();
+
+    let mb: &dyn AsyncMessageBus = bus.as_ref();
+    assert!(mb.is_connected());
+
+    stream.close();
+    bus.clone().process_messages(0, TICK).expect("the dispatcher starts");
+
+    let started = std::time::Instant::now();
+    while mb.is_connected() {
+        assert!(started.elapsed() < Duration::from_secs(2), "the dispatcher did not report the loss");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        stream.reconnect_failures_remaining(),
+        1000,
+        "a reconnect was attempted although auto-reconnect is off"
+    );
+}
+
+/// The default is unchanged: a socket failure is answered by reconnecting.
+#[tokio::test]
+async fn test_a_socket_failure_with_auto_reconnect_attempts_a_reconnect() {
+    let (stream, bus) = make_bus();
+    stream.set_reconnect_failures(1000);
+
+    stream.close();
+    bus.clone().process_messages(0, TICK).expect("the dispatcher starts");
+
+    let started = std::time::Instant::now();
+    while stream.reconnect_failures_remaining() == 1000 {
+        assert!(started.elapsed() < Duration::from_secs(2), "no reconnect was attempted");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mb: &dyn AsyncMessageBus = bus.as_ref();
+    mb.request_shutdown_sync();
+}

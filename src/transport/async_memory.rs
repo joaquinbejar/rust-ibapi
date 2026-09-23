@@ -54,6 +54,12 @@ impl MemoryStream {
     pub fn set_reconnect_failures(&self, count: usize) {
         self.inner.lock().unwrap().reconnect_failures = count;
     }
+
+    /// How many scheduled `reconnect()` failures are still pending: a test
+    /// that scheduled some can tell whether a reconnect was attempted.
+    pub fn reconnect_failures_remaining(&self) -> usize {
+        self.inner.lock().unwrap().reconnect_failures
+    }
 }
 
 impl std::fmt::Debug for MemoryStream {

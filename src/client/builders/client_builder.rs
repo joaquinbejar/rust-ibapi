@@ -51,6 +51,8 @@ pub(super) struct BuilderState {
     pub(super) client_id: Option<i32>,
     pub(super) tcp_no_delay: bool,
     pub(super) startup_callback: Option<Arc<dyn Fn(StartupMessage) + Send + Sync>>,
+    /// `true` turns the transport's own reconnect loop off (async only).
+    pub(super) no_auto_reconnect: bool,
 }
 
 /// Output of [`BuilderState::validate`]: same fields with `address` and
@@ -61,6 +63,7 @@ pub(super) struct ValidatedPieces {
     pub(super) client_id: i32,
     pub(super) tcp_no_delay: bool,
     pub(super) startup_callback: Option<Arc<dyn Fn(StartupMessage) + Send + Sync>>,
+    pub(super) no_auto_reconnect: bool,
 }
 
 impl BuilderState {
@@ -74,6 +77,7 @@ impl BuilderState {
                 .ok_or_else(|| Error::InvalidArgument("ClientBuilder: client_id is required".into()))?,
             tcp_no_delay: self.tcp_no_delay,
             startup_callback: self.startup_callback,
+            no_auto_reconnect: self.no_auto_reconnect,
         })
     }
 }
@@ -305,6 +309,30 @@ pub mod async_impl {
             self
         }
 
+        /// Turn the transport's own reconnect loop off. Default: on.
+        ///
+        /// By default, when the socket fails the message dispatcher reconnects
+        /// on the same client id by itself (up to twenty attempts with
+        /// backoff), replaying the handshake behind the caller's back. A caller
+        /// that supervises the connection itself (to check it may still hold
+        /// the client id, to reseed what it derived from the old session, or to
+        /// bound its own shutdown) needs the failure instead: with this off, a
+        /// socket error shuts the client down, its streams end, and
+        /// `is_connected()` turns false.
+        ///
+        /// # Examples
+        ///
+        /// ```no_run
+        /// # async fn run() -> Result<(), ibapi::Error> {
+        /// use ibapi::Client;
+        /// let _client = Client::builder().address("127.0.0.1:4002").client_id(100).auto_reconnect(false).connect().await?;
+        /// # Ok(()) }
+        /// ```
+        pub fn auto_reconnect(mut self, enabled: bool) -> Self {
+            self.state.no_auto_reconnect = !enabled;
+            self
+        }
+
         /// Set a callback for unsolicited typed messages during the handshake.
         ///
         /// Fires for `OpenOrder`, `OrderStatus`, account updates, and other
@@ -386,7 +414,15 @@ pub mod async_impl {
 
         async fn connect_with_sender(self, sender: broadcast::Sender<Notice>) -> Result<Client, Error> {
             let pieces = self.state.validate()?;
-            Client::connect_with_pieces(&pieces.address, pieces.client_id, pieces.tcp_no_delay, pieces.startup_callback, sender).await
+            Client::connect_with_pieces(
+                &pieces.address,
+                pieces.client_id,
+                pieces.tcp_no_delay,
+                pieces.startup_callback,
+                sender,
+                !pieces.no_auto_reconnect,
+            )
+            .await
         }
     }
 }
