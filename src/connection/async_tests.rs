@@ -284,3 +284,45 @@ async fn reconnect_clears_metadata_while_waiting_for_handshake() {
     assert_eq!(metadata.managed_accounts, "DU1234567");
     assert_eq!(metadata.time_zone, Some(timezones::db::EST));
 }
+
+/// IB refuses a second connection on a client id another connection holds:
+/// error 326 during the handshake, then a closed socket. It must surface as
+/// that refusal, not as the transport failure the close would otherwise be
+/// read as, so a supervisor can tell "id in use" from "gateway unreachable".
+#[tokio::test]
+async fn establish_connection_surfaces_a_client_id_in_use_as_that_refusal() {
+    let stream = MemoryStream::default();
+    let connection = AsyncConnection::stubbed(stream.clone(), CLIENT_ID);
+
+    let handshake = format!("{}\020240120 12:00:00 EST\0", SERVER_VERSION);
+    stream.push_inbound(handshake.into_bytes());
+    stream.push_inbound(binary_text(
+        IncomingMessages::Error as i32,
+        "-1\0326\0Unable to connect as the client id is already in use. Retry with a unique client id.\0\01705752000000\0",
+    ));
+    stream.close();
+
+    match connection.establish_connection().await {
+        Err(crate::errors::Error::Notice(notice)) => assert_eq!(notice.code, 326),
+        other => panic!("expected the 326 refusal, got {other:?}"),
+    }
+}
+
+/// Any other handshake-time notice keeps its existing treatment: delivered to
+/// the notice sink, and the handshake carries on.
+#[tokio::test]
+async fn establish_connection_still_passes_other_notices_through() {
+    let stream = MemoryStream::default();
+    let connection = AsyncConnection::stubbed(stream.clone(), CLIENT_ID);
+
+    let handshake = format!("{}\020240120 12:00:00 EST\0", SERVER_VERSION);
+    stream.push_inbound(handshake.into_bytes());
+    stream.push_inbound(binary_text(
+        IncomingMessages::Error as i32,
+        "-1\02104\0Market data farm connection is OK:usfarm\0\01705752000000\0",
+    ));
+    stream.push_inbound(binary_text(IncomingMessages::NextValidId as i32, "1\090\0"));
+    stream.push_inbound(binary_text(IncomingMessages::ManagedAccounts as i32, "1\0DU1234567\0"));
+
+    connection.establish_connection().await.expect("a farm notice does not end the handshake");
+}

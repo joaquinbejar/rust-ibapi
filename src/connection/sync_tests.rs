@@ -233,3 +233,23 @@ fn handshake_unexpected_eof_returns_connection_rejected() {
         other => panic!("expected Error::ConnectionRejected, got {other:?}"),
     }
 }
+
+/// The blocking client surfaces a refused client id the same way.
+#[test]
+fn establish_connection_surfaces_a_client_id_in_use_as_that_refusal() {
+    let stream = MemoryStream::default();
+    let connection = Connection::stubbed(stream.clone(), CLIENT_ID);
+
+    let handshake = format!("{}\020240120 12:00:00 EST\0", SERVER_VERSION);
+    stream.push_inbound(handshake.into_bytes());
+    stream.push_inbound(binary_text(
+        IncomingMessages::Error as i32,
+        "-1\0326\0Unable to connect as the client id is already in use. Retry with a unique client id.\0\01705752000000\0",
+    ));
+    stream.close();
+
+    match connection.establish_connection() {
+        Err(crate::errors::Error::Notice(notice)) => assert_eq!(notice.code, 326),
+        other => panic!("expected the 326 refusal, got {other:?}"),
+    }
+}

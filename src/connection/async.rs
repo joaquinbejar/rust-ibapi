@@ -255,6 +255,13 @@ impl<S: AsyncStream> AsyncConnection<S> {
         let server_version = self.server_version();
         loop {
             let mut message = self.read_message().await?;
+            // A refused client id ends the handshake here, as itself, rather
+            // than as the transport failure the gateway's close would be read
+            // as on the next read.
+            if let Some(notice) = super::common::client_id_refusal(&message) {
+                ctx.notice_sink.deliver(notice.clone());
+                return Err(Error::Notice(notice));
+            }
             let info = self.connection_handler.parse_account_info(server_version, &mut message, &ctx)?;
 
             // Merge received info
