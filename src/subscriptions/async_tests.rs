@@ -412,6 +412,55 @@ async fn test_subscription_try_cancel_reports_the_write() {
     assert_eq!(message_bus.request_messages().len(), 1, "and nothing written again");
 }
 
+/// The reviewer's case (ACS 1253): a best-effort `cancel()` whose write
+/// failed closes the subscription locally, and a later `try_cancel` must still
+/// write the cancel request rather than report the local close as sent.
+#[tokio::test]
+async fn test_try_cancel_after_a_failed_best_effort_cancel_still_writes() {
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (_tx, rx) = broadcast::channel(100);
+    let internal = AsyncInternalSubscription::new(rx);
+    let cancel_fn: CancelFn =
+        Box::new(|_version, _id, _ctx| Ok(crate::messages::encode_protobuf_message(OutgoingMessages::CancelMarketData as i32, &[])));
+    let mut subscription: Subscription<String> = Subscription::with_decoder(
+        internal,
+        message_bus.clone(),
+        |_context, _msg| Ok("test".to_string()),
+        Some(322),
+        None,
+        DecoderContext::default(),
+    );
+    subscription.cancel_fn = Some(Arc::new(cancel_fn));
+
+    message_bus.set_fail_sends(true);
+    subscription.cancel().await;
+    assert!(subscription.cancelled.load(Ordering::Relaxed), "closed locally");
+    assert!(!subscription.cancel_sent.load(Ordering::Relaxed), "but nothing was sent");
+
+    message_bus.set_fail_sends(false);
+    assert!(subscription.try_cancel().await.is_ok());
+    assert_eq!(message_bus.request_messages().len(), 1, "the cancel request is written now");
+    assert!(subscription.cancel_sent.load(Ordering::Relaxed));
+}
+
+/// A subscription with no cancel request cannot prove a cancel went out.
+#[tokio::test]
+async fn test_try_cancel_without_a_cancel_request_is_an_error() {
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (_tx, rx) = broadcast::channel(100);
+    let internal = AsyncInternalSubscription::new(rx);
+    let subscription: Subscription<String> = Subscription::with_decoder(
+        internal,
+        message_bus.clone(),
+        |_context, _msg| Ok("test".to_string()),
+        Some(323),
+        None,
+        DecoderContext::default(),
+    );
+    assert!(matches!(subscription.try_cancel().await, Err(Error::InvalidArgument(_))));
+    assert!(message_bus.request_messages().is_empty());
+}
+
 #[tokio::test]
 async fn test_subscription_clone() {
     let message_bus = Arc::new(MessageBusStub::default());

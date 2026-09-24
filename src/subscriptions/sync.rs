@@ -44,6 +44,9 @@ pub struct Subscription<T: StreamDecoder<T>> {
     message_type: Option<OutgoingMessages>,
     phantom: PhantomData<T>,
     cancelled: AtomicBool,
+    /// Whether a cancel request was written to the session: only this proves
+    /// it went out (see `try_cancel`).
+    cancel_sent: AtomicBool,
     snapshot_ended: AtomicBool,
     stream_ended: AtomicBool,
     subscription: InternalSubscription,
@@ -70,6 +73,7 @@ impl<T: StreamDecoder<T>> Subscription<T> {
             subscription,
             phantom: PhantomData,
             cancelled: AtomicBool::new(false),
+            cancel_sent: AtomicBool::new(false),
             snapshot_ended: AtomicBool::new(false),
             stream_ended: AtomicBool::new(false),
         }
@@ -78,9 +82,12 @@ impl<T: StreamDecoder<T>> Subscription<T> {
     /// Cancel the subscription.
     ///
     /// Best effort: a cancel request that cannot be written is logged, and the
-    /// subscription is marked cancelled anyway. Use [`try_cancel`](Self::try_cancel)
-    /// to know whether it was written.
+    /// subscription is closed locally anyway. Use [`try_cancel`](Self::try_cancel)
+    /// to know whether a cancel request went out.
     pub fn cancel(&self) {
+        if self.snapshot_ended.load(Ordering::Relaxed) || self.cancelled.load(Ordering::Relaxed) {
+            return;
+        }
         if let Err(e) = self.try_cancel() {
             warn!("error cancelling subscription: {e}");
             self.cancelled.store(true, Ordering::Relaxed);
@@ -88,22 +95,26 @@ impl<T: StreamDecoder<T>> Subscription<T> {
         }
     }
 
-    /// Cancel the subscription, and say whether the cancel request was written
-    /// to the session.
+    /// Cancel the subscription, and say whether a cancel request was written to
+    /// the session.
     ///
     /// IB acknowledges no cancellation of a market-data or streaming request,
     /// so the written request is the last point a caller can confirm. Returns
-    /// `Ok(())` once it is written, or when there is nothing to cancel (already
-    /// cancelled, a snapshot that ended, no way to address the request). On a
-    /// write error the subscription is **not** marked cancelled, so a later
-    /// cancel, or the drop, tries again.
+    /// `Ok(())` when a cancel request was written, by this call or an earlier
+    /// one, or when the resource itself ended (a snapshot whose data arrived);
+    /// a subscription closed locally by a best-effort [`cancel`](Self::cancel)
+    /// whose write failed is **not** a sent cancel, and this writes it. On a
+    /// write error nothing is recorded as sent, so a later call tries again.
     ///
     /// # Errors
-    /// The error of encoding or writing the cancel request.
+    /// [`Error::InvalidArgument`] when this subscription has no way to address
+    /// a cancel request; otherwise the error of encoding or writing it.
     pub fn try_cancel(&self) -> Result<(), Error> {
-        // Skip on snapshot subscriptions whose data already arrived.
-        if self.snapshot_ended.load(Ordering::Relaxed) || self.cancelled.load(Ordering::Relaxed) {
+        if self.cancel_sent.load(Ordering::Relaxed) || self.snapshot_ended.load(Ordering::Relaxed) {
             return Ok(());
+        }
+        if self.request_id.is_none() && self.order_id.is_none() && self.message_type.is_none() {
+            return Err(Error::InvalidArgument("this subscription has no cancel request to send".to_owned()));
         }
         let message = T::cancel_message(self.context.server_version, self.request_id, Some(&self.context))?;
         if let Some(request_id) = self.request_id {
@@ -112,10 +123,8 @@ impl<T: StreamDecoder<T>> Subscription<T> {
             self.message_bus.cancel_order_subscription(order_id, &message)?;
         } else if let Some(message_type) = self.message_type {
             self.message_bus.cancel_shared_subscription(message_type, &message)?;
-        } else {
-            debug!("Could not determine cancel method");
-            return Ok(());
         }
+        self.cancel_sent.store(true, Ordering::Relaxed);
         self.cancelled.store(true, Ordering::Relaxed);
         self.subscription.cancel();
         Ok(())
