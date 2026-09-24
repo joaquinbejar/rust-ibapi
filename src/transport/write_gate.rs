@@ -18,8 +18,15 @@
 //!   until `retry_at` or its deadline, whichever comes first, takes the lock
 //!   again, and asks again. Other writes on the connection go ahead meanwhile.
 //!
-//! Each call has one [`Deadline`], asked of the gate once, before the call
-//! waits for the writer's lock, and kept across every release and retake:
+//! Each write is one [`WriteCall`], begun with [`WriteGate::begin`] before the
+//! write waits for the writer's lock, kept across every release and retake of
+//! it, and dropped when the write ends, however it ends: written, refused,
+//! past its deadline, closed, or its future dropped while it waits. A gate
+//! that queues writes keeps each one's place in its call, and its `Drop` is
+//! where the place is given up.
+//!
+//! Each call has one [`Deadline`], asked of it once, before the write waits
+//! for the writer's lock, and kept across every release and retake:
 //!
 //! - [`Deadline::At`]: waiting for the lock counts against it, and a call past
 //!   it is refused without writing, even on its first try, so an expired
@@ -74,13 +81,23 @@ pub enum Deadline {
 
 /// Decides, at each write, whether it may go out now.
 pub trait WriteGate: Send + Sync + 'static {
-    /// The deadline of the write described by `meta`. Asked once, before the
-    /// write waits for the writer's lock.
-    fn deadline(&self, meta: &OutgoingMeta) -> Deadline;
+    /// Begin the write described by `meta`. Called once per write, before it
+    /// waits for the writer's lock.
+    fn begin(&self, meta: &OutgoingMeta) -> Box<dyn WriteCall>;
+}
+
+/// One write's call to the gate, from its beginning to its end.
+///
+/// Every answer the write gets comes from this call, and it is dropped
+/// exactly once, when the write ends, whatever ended it.
+pub trait WriteCall: Send {
+    /// The write's deadline. Asked once, before the write waits for the
+    /// writer's lock.
+    fn deadline(&self) -> Deadline;
 
     /// Whether the write may go out now. Called with the writer's lock held
     /// and before any byte: it must not block.
-    fn admit(&self, meta: &OutgoingMeta) -> Admit;
+    fn admit(&mut self) -> Admit;
 }
 
 /// Describe a message body (without its length prefix) for a gate.

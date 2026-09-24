@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::io::{AsyncIo, AsyncReconnect, AsyncTcpSocket};
 use crate::messages::{encode_protobuf_message, encode_raw_length, OutgoingMessages};
-use crate::transport::write_gate::{describe, Admit, Deadline, OutgoingMeta, WriteGate};
+use crate::transport::write_gate::{describe, Admit, Deadline, OutgoingMeta, WriteCall, WriteGate};
 use crate::Error;
 
 async fn pair(gate: Arc<dyn WriteGate>) -> (Arc<AsyncTcpSocket>, TcpStream) {
@@ -59,6 +59,76 @@ async fn frames(peer: &mut TcpStream) -> Vec<Vec<u8>> {
     bodies
 }
 
+/// A gate that answers from the message alone. [`Calls`] makes it a
+/// [`WriteGate`], one [`WriteCall`] per write, counting how many were begun
+/// and how many ended.
+pub(super) trait SimpleGate: Send + Sync + 'static {
+    fn deadline(&self, meta: &OutgoingMeta) -> Deadline;
+    fn admit(&self, meta: &OutgoingMeta) -> Admit;
+}
+
+pub(super) struct Calls<G> {
+    gate: Arc<G>,
+    begun: Arc<AtomicUsize>,
+    ended: Arc<AtomicUsize>,
+}
+
+impl<G: SimpleGate> Calls<G> {
+    pub(super) fn new(gate: &Arc<G>) -> Arc<Self> {
+        Arc::new(Self {
+            gate: Arc::clone(gate),
+            begun: Arc::new(AtomicUsize::new(0)),
+            ended: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+    fn begun(&self) -> usize {
+        self.begun.load(Ordering::SeqCst)
+    }
+    fn ended(&self) -> usize {
+        self.ended.load(Ordering::SeqCst)
+    }
+}
+
+struct Call<G> {
+    gate: Arc<G>,
+    meta: OutgoingMeta,
+    admits: usize,
+    ended: Arc<AtomicUsize>,
+}
+
+impl<G: SimpleGate> WriteGate for Calls<G> {
+    fn begin(&self, meta: &OutgoingMeta) -> Box<dyn WriteCall> {
+        self.begun.fetch_add(1, Ordering::SeqCst);
+        Box::new(Call {
+            gate: Arc::clone(&self.gate),
+            meta: *meta,
+            admits: 0,
+            ended: Arc::clone(&self.ended),
+        })
+    }
+}
+
+impl<G: SimpleGate> WriteCall for Call<G> {
+    fn deadline(&self) -> Deadline {
+        self.gate.deadline(&self.meta)
+    }
+    fn admit(&mut self) -> Admit {
+        self.admits += 1;
+        self.gate.admit(&self.meta)
+    }
+}
+
+impl<G> Drop for Call<G> {
+    fn drop(&mut self) {
+        self.ended.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A gate as the SDK sees it, one call per write.
+pub(super) fn gated<G: SimpleGate>(gate: &Arc<G>) -> Arc<dyn WriteGate> {
+    Calls::new(gate)
+}
+
 /// A gate driven by closures, counting its calls.
 struct Scripted {
     deadline: Box<dyn Fn(&OutgoingMeta) -> Deadline + Send + Sync>,
@@ -81,7 +151,7 @@ impl Scripted {
     }
 }
 
-impl WriteGate for Scripted {
+impl SimpleGate for Scripted {
     fn deadline(&self, meta: &OutgoingMeta) -> Deadline {
         self.deadlines.fetch_add(1, Ordering::SeqCst);
         (self.deadline)(meta)
@@ -121,7 +191,7 @@ async fn later_releases_the_writer_so_another_write_goes_first() {
             },
         },
     );
-    let (socket, mut peer) = pair(gate).await;
+    let (socket, mut peer) = pair(gated(&gate)).await;
     let placing = tokio::spawn({
         let socket = Arc::clone(&socket);
         async move { write(&socket, &place(7)).await }
@@ -150,7 +220,7 @@ async fn a_call_keeps_one_deadline_across_every_retry() {
             retry_at: Instant::now() + Duration::from_millis(20),
         },
     );
-    let (socket, mut peer) = pair(Arc::clone(&gate) as Arc<dyn WriteGate>).await;
+    let (socket, mut peer) = pair(gated(&gate)).await;
     let started = Instant::now();
     let outcome = write(&socket, &place(8)).await;
     let elapsed = started.elapsed();
@@ -166,7 +236,7 @@ async fn a_call_keeps_one_deadline_across_every_retry() {
 #[tokio::test]
 async fn a_refusal_hands_no_byte_to_the_socket() {
     let gate = Scripted::new(|_| soon(), |_| Admit::Refuse("not now"));
-    let (socket, mut peer) = pair(gate).await;
+    let (socket, mut peer) = pair(gated(&gate)).await;
     let outcome = write(&socket, &place(9)).await;
     assert!(matches!(outcome, Err(Error::Refused(ref reason)) if reason == "not now"), "{outcome:?}");
     socket.shutdown();
@@ -181,7 +251,7 @@ async fn a_shutdown_ends_a_wait_at_once() {
             retry_at: Instant::now() + Duration::from_secs(60),
         },
     );
-    let (socket, mut peer) = pair(gate).await;
+    let (socket, mut peer) = pair(gated(&gate)).await;
     let waiting = tokio::spawn({
         let socket = Arc::clone(&socket);
         async move { write(&socket, &place(10)).await }
@@ -207,7 +277,7 @@ async fn the_deadline_covers_the_wait_for_the_writer() {
         },
         |_| Admit::Write,
     );
-    let (socket, mut peer) = pair(Arc::clone(&gate) as Arc<dyn WriteGate>).await;
+    let (socket, mut peer) = pair(gated(&gate)).await;
     let big = tokio::spawn({
         let socket = Arc::clone(&socket);
         async move {
@@ -242,7 +312,7 @@ async fn no_wait_is_one_try_now() {
     // Market data's "now or never": the gate is asked once, and a slot means
     // a write.
     let gate = Scripted::new(|_| Deadline::NoWait, |_| Admit::Write);
-    let (socket, mut peer) = pair(gate).await;
+    let (socket, mut peer) = pair(gated(&gate)).await;
     write(&socket, &place(12)).await.expect("written at once");
 
     // And `Later` is not waited for.
@@ -252,7 +322,7 @@ async fn no_wait_is_one_try_now() {
             retry_at: Instant::now() + Duration::from_secs(5),
         },
     );
-    let (other, mut other_peer) = pair(Arc::clone(&held) as Arc<dyn WriteGate>).await;
+    let (other, mut other_peer) = pair(gated(&held)).await;
     let started = Instant::now();
     let refused = tokio::time::timeout(Duration::from_secs(1), write(&other, &place(13)))
         .await
@@ -273,7 +343,7 @@ async fn an_expired_deadline_is_never_tried_even_first() {
     // being asked, even though the writer is free: NoWait's "one try" is not
     // a way round an expired deadline (ACS 1712).
     let gate = Scripted::new(|_| Deadline::At(Instant::now() - Duration::from_millis(1)), |_| Admit::Write);
-    let (socket, mut peer) = pair(Arc::clone(&gate) as Arc<dyn WriteGate>).await;
+    let (socket, mut peer) = pair(gated(&gate)).await;
     assert!(matches!(write(&socket, &place(14)).await, Err(Error::Refused(_))));
     assert_eq!(gate.admits.load(Ordering::SeqCst), 0, "an expired write was tried");
     socket.shutdown();
@@ -316,11 +386,89 @@ fn the_gate_is_told_the_message_and_its_order_id() {
 fn a_gate_is_asked_under_a_lock_it_never_waits_on() {
     // A compile-time reminder of the contract: `admit` is synchronous, so the
     // writer's lock can never be held across a wait inside it.
-    fn assert_sync_admit<G: WriteGate>(gate: &G, meta: &OutgoingMeta) -> Admit {
-        gate.admit(meta)
+    fn assert_sync_admit(call: &mut dyn WriteCall) -> Admit {
+        call.admit()
     }
-    let gate = Scripted::new(|_| soon(), |_| Admit::Write);
+    let gate = gated(&Scripted::new(|_| soon(), |_| Admit::Write));
+    let mut call = gate.begin(&describe(&place(1), None, false));
     let recorded = Mutex::new(());
     let _guard = recorded.lock().expect("not poisoned");
-    assert_eq!(assert_sync_admit(gate.as_ref(), &describe(&place(1), None, false)), Admit::Write);
+    assert_eq!(assert_sync_admit(call.as_mut()), Admit::Write);
+}
+
+#[tokio::test]
+async fn a_write_is_one_call_asked_again_across_every_retry() {
+    // Three `Later`s, then a slot: one call is begun for the write, all four
+    // answers come from it, and it ends once, when the write does.
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&asked);
+    let gate = Scripted::new(
+        |_| soon(),
+        move |_| {
+            if counter.fetch_add(1, Ordering::SeqCst) < 3 {
+                Admit::Later {
+                    retry_at: Instant::now() + Duration::from_millis(10),
+                }
+            } else {
+                Admit::Write
+            }
+        },
+    );
+    let calls = Calls::new(&gate);
+    let (socket, mut peer) = pair(calls.clone()).await;
+    write(&socket, b"49\x001\x00").await.expect("written");
+    assert_eq!(asked.load(Ordering::SeqCst), 4);
+    assert_eq!(calls.begun(), 1, "a call was begun per answer, not per write");
+    assert_eq!(calls.ended(), 1);
+    socket.shutdown();
+    assert_eq!(frames(&mut peer).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_call_ends_once_however_its_write_ends() {
+    // Every way a write can end, including its future dropped while it
+    // waits: a gate that queues writes gives up the place in its call's
+    // drop, so a call that never ends would hold its place forever.
+    async fn ends(admit: fn() -> Admit, deadline: fn() -> Deadline, how: &str, run: impl FnOnce(Arc<AsyncTcpSocket>) -> tokio::task::JoinHandle<()>) {
+        let gate = Scripted::new(move |_| deadline(), move |_| admit());
+        let calls = Calls::new(&gate);
+        let (socket, _peer) = pair(calls.clone()).await;
+        let handle = run(Arc::clone(&socket));
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await.expect("the write ends");
+        assert_eq!((calls.begun(), calls.ended()), (1, 1), "{how}");
+    }
+    fn later() -> Admit {
+        Admit::Later {
+            retry_at: Instant::now() + Duration::from_secs(60),
+        }
+    }
+    let once = |socket: Arc<AsyncTcpSocket>| {
+        tokio::spawn(async move {
+            let _ = write(&socket, b"49\x001\x00").await;
+        })
+    };
+    ends(|| Admit::Write, soon, "written", once).await;
+    ends(|| Admit::Refuse("test"), soon, "refused", once).await;
+    ends(later, || in_ms(200), "past its deadline", once).await;
+    ends(later, || Deadline::NoWait, "no wait", once).await;
+    ends(later, soon, "closed while waiting", |socket: Arc<AsyncTcpSocket>| {
+        tokio::spawn(async move {
+            let closer = Arc::clone(&socket);
+            let writing = tokio::spawn(async move { write(&socket, b"49\x001\x00").await });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            closer.shutdown();
+            let written = writing.await.expect("joins");
+            assert!(matches!(written, Err(Error::Closed)), "{written:?}");
+        })
+    })
+    .await;
+    ends(later, soon, "dropped while waiting", |socket: Arc<AsyncTcpSocket>| {
+        tokio::spawn(async move {
+            let writing = tokio::spawn(async move { write(&socket, b"49\x001\x00").await });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            writing.abort();
+            assert!(writing.await.expect_err("aborted").is_cancelled());
+        })
+    })
+    .await;
 }

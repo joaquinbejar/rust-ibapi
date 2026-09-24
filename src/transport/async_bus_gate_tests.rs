@@ -9,16 +9,18 @@ use std::time::{Duration, Instant};
 use prost::Message as _;
 use tokio::net::{TcpListener, TcpStream};
 
+use super::gate_tests::{gated, SimpleGate};
 use super::io::AsyncTcpSocket;
 use super::{AsyncMessageBus, AsyncTcpMessageBus, Table};
 use crate::connection::r#async::AsyncConnection;
 use crate::messages::{encode_protobuf_message, IncomingMessages, OutgoingMessages};
-use crate::transport::write_gate::{Admit, Deadline, OutgoingMeta, WriteGate};
+use crate::transport::write_gate::{Admit, Deadline, OutgoingMeta};
 use crate::Error;
 
 type Bus = Arc<AsyncTcpMessageBus<AsyncTcpSocket>>;
 
-async fn bus(gate: Arc<dyn WriteGate>) -> (Bus, TcpStream) {
+async fn bus<G: SimpleGate>(gate: Arc<G>) -> (Bus, TcpStream) {
+    let gate = gated(&gate);
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("local address").to_string();
     let (socket, accepted) = tokio::join!(AsyncTcpSocket::connect(&address, true, Some(gate)), listener.accept());
@@ -76,7 +78,7 @@ impl Switch {
     }
 }
 
-impl WriteGate for Switch {
+impl SimpleGate for Switch {
     fn deadline(&self, _meta: &OutgoingMeta) -> Deadline {
         Deadline::At(Instant::now() + self.deadline)
     }

@@ -138,9 +138,11 @@ impl AsyncIo for AsyncTcpSocket {
         let Some(gate) = self.gate.as_ref() else {
             return self.write_all(buf).await;
         };
-        // One deadline for the whole call, asked once, before the wait for
-        // the writer's lock, and kept across every retry.
-        let deadline = gate.deadline(meta);
+        // One call for the whole write, begun before the wait for the
+        // writer's lock and kept across every retry; dropped on every exit,
+        // the drop of this future included. Its deadline is asked once.
+        let mut call = gate.begin(meta);
+        let deadline = call.deadline();
         loop {
             // Armed before the closed flag is read, so a close in between
             // still wakes the wait below.
@@ -177,7 +179,7 @@ impl AsyncIo for AsyncTcpSocket {
                     return Err(Error::Refused("the write's deadline passed".to_owned()));
                 }
             }
-            match gate.admit(meta) {
+            match call.admit() {
                 Admit::Write => {
                     writer.write_all(buf).await?;
                     writer.flush().await?;
