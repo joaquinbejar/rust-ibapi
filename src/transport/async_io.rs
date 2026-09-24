@@ -15,7 +15,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
 
-use super::super::write_gate::{Admit, Deadline, OutgoingMeta, WriteGate};
+use super::super::write_gate::{Admit, Deadline, OutgoingMeta, Refusal, Waiting, WriteGate};
 use crate::errors::Error;
 
 #[async_trait]
@@ -143,6 +143,9 @@ impl AsyncIo for AsyncTcpSocket {
         // the drop of this future included. Its deadline is asked once.
         let mut call = gate.begin(meta);
         let deadline = call.deadline();
+        // What the write was last waiting for, so a deadline that passes is
+        // named by the wait it ended, across every release and retake.
+        let mut waiting = Waiting::Start;
         loop {
             // Armed before the closed flag is read, so a close in between
             // still wakes the wait below.
@@ -156,17 +159,18 @@ impl AsyncIo for AsyncTcpSocket {
                 // One try, now: the lock free and the gate willing, or nothing.
                 Deadline::NoWait => match self.writer.try_lock() {
                     Ok(writer) => writer,
-                    Err(_) => return Err(Error::Refused("the writer is busy and the write does not wait".to_owned())),
+                    Err(_) => return Err(Error::Refused(Refusal::Busy)),
                 },
                 // A deadline that has passed is never tried, first attempt
                 // included; the wait for the writer's lock counts against it.
                 Deadline::At(at) => {
                     if Instant::now() >= at {
-                        return Err(Error::Refused("the write's deadline passed".to_owned()));
+                        return Err(Error::Refused(Refusal::Expired { waiting_for: waiting }));
                     }
+                    waiting = Waiting::Writer;
                     match tokio::time::timeout_at(at.into(), self.writer.lock()).await {
                         Ok(writer) => writer,
-                        Err(_) => return Err(Error::Refused("the write's deadline passed waiting for the writer".to_owned())),
+                        Err(_) => return Err(Error::Refused(Refusal::Expired { waiting_for: waiting })),
                     }
                 }
             };
@@ -176,7 +180,7 @@ impl AsyncIo for AsyncTcpSocket {
             }
             if let Deadline::At(at) = deadline {
                 if Instant::now() >= at {
-                    return Err(Error::Refused("the write's deadline passed".to_owned()));
+                    return Err(Error::Refused(Refusal::Expired { waiting_for: waiting }));
                 }
             }
             match call.admit() {
@@ -185,16 +189,17 @@ impl AsyncIo for AsyncTcpSocket {
                     writer.flush().await?;
                     return Ok(());
                 }
-                Admit::Refuse(reason) => return Err(Error::Refused(reason.to_owned())),
+                Admit::Refuse(reason) => return Err(Error::Refused(Refusal::Gate(reason))),
                 Admit::Later { retry_at } => {
                     // Never wait holding the writer's lock: other writes on
                     // this connection go ahead meanwhile.
                     drop(writer);
                     let Deadline::At(at) = deadline else {
-                        return Err(Error::Refused("no slot now, and the write does not wait".to_owned()));
+                        return Err(Error::Refused(Refusal::NoSlot));
                     };
+                    waiting = Waiting::Slot;
                     if Instant::now() >= at {
-                        return Err(Error::Refused("the write's deadline passed".to_owned()));
+                        return Err(Error::Refused(Refusal::Expired { waiting_for: waiting }));
                     }
                     let until = retry_at.min(at);
                     tokio::select! {

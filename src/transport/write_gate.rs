@@ -38,6 +38,7 @@
 
 use std::time::Instant;
 
+pub use crate::errors::{GateReason, Refusal, Waiting};
 use crate::messages::{OutgoingMessages, PROTOBUF_MSG_ID};
 
 /// What a write is about to send, for a [`WriteGate`].
@@ -61,7 +62,7 @@ pub enum Admit {
     /// Write now.
     Write,
     /// Do not write this message.
-    Refuse(&'static str),
+    Refuse(GateReason),
     /// Not yet: ask again at `retry_at`, or when the deadline comes.
     Later {
         /// When asking again may succeed.

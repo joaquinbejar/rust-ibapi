@@ -99,8 +99,8 @@ pub enum Error {
     /// The client's write gate refused this message, or its deadline passed,
     /// **before any byte of it was handed to the socket**: it was not sent.
     /// The same guarantee as [`Error::Closed`].
-    #[error("Refused: the write gate did not let the message go out ({0})")]
-    Refused(String),
+    #[error("Refused: the write gate did not let the message go out: {0}")]
+    Refused(Refusal),
 
     /// Reached end of data stream.
     #[error("EndOfStream")]
@@ -226,7 +226,7 @@ impl Clone for Error {
             Error::Cancelled => Error::Cancelled,
             Error::Shutdown => Error::Shutdown,
             Error::Closed => Error::Closed,
-            Error::Refused(reason) => Error::Refused(reason.clone()),
+            Error::Refused(refusal) => Error::Refused(*refusal),
             Error::EndOfStream => Error::EndOfStream,
             Error::UnexpectedResponse(m) => Error::UnexpectedResponse(m.clone()),
             Error::UnexpectedEndOfStream => Error::UnexpectedEndOfStream,
@@ -269,3 +269,63 @@ impl From<ValidationError> for Error {
 #[cfg(test)]
 #[path = "errors_tests.rs"]
 mod tests;
+
+/// Why a gate refused a message: a code the gate defines, stable, for the
+/// caller to act on, and a text for logs only. Nothing should act on the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GateReason {
+    /// The gate's code for the reason.
+    pub code: u16,
+    /// A description, for a log.
+    pub text: &'static str,
+}
+
+impl std::fmt::Display for GateReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} (gate reason {})", self.text, self.code)
+    }
+}
+
+/// What a write was waiting for when its deadline came.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Waiting {
+    /// Nothing yet: the deadline had passed before the write began to wait.
+    Start,
+    /// The writer's lock, another write holding it.
+    Writer,
+    /// A slot: the gate had answered `Later`.
+    Slot,
+}
+
+/// Why a write was refused before any byte of it reached the socket.
+///
+/// Every refusal carries the same guarantee, whatever its cause: nothing of
+/// the message was sent. The cause is for the caller to decide what the
+/// refusal means, a deferral or not, without reading text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Refusal {
+    /// The gate refused the message.
+    Gate(GateReason),
+    /// The write's deadline passed while it waited for `waiting_for`: the
+    /// last wait it was in, across every release and retake of the lock.
+    Expired {
+        /// What it was waiting for when the deadline came.
+        waiting_for: Waiting,
+    },
+    /// The write does not wait, and another write held the writer's lock.
+    Busy,
+    /// The write does not wait, and the gate had no slot now.
+    NoSlot,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gate(reason) => write!(formatter, "the gate refused it: {reason}"),
+            Self::Expired { waiting_for } => write!(formatter, "its deadline passed waiting for {waiting_for:?}"),
+            Self::Busy => formatter.write_str("the writer was busy and the write does not wait"),
+            Self::NoSlot => formatter.write_str("no slot now, and the write does not wait"),
+        }
+    }
+}

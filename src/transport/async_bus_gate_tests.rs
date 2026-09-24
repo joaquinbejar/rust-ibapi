@@ -14,7 +14,7 @@ use super::io::AsyncTcpSocket;
 use super::{AsyncMessageBus, AsyncTcpMessageBus, Table};
 use crate::connection::r#async::AsyncConnection;
 use crate::messages::{encode_protobuf_message, IncomingMessages, OutgoingMessages};
-use crate::transport::write_gate::{Admit, Deadline, OutgoingMeta};
+use crate::transport::write_gate::{Admit, Deadline, GateReason, OutgoingMeta};
 use crate::Error;
 
 type Bus = Arc<AsyncTcpMessageBus<AsyncTcpSocket>>;
@@ -96,7 +96,7 @@ impl SimpleGate for Switch {
             };
         }
         if self.refuse.load(Ordering::SeqCst) {
-            Admit::Refuse("test")
+            Admit::Refuse(GateReason { code: 1, text: "test" })
         } else {
             Admit::Write
         }

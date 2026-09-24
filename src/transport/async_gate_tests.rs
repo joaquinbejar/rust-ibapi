@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use super::io::{AsyncIo, AsyncReconnect, AsyncTcpSocket};
 use crate::messages::{encode_protobuf_message, encode_raw_length, OutgoingMessages};
-use crate::transport::write_gate::{describe, Admit, Deadline, OutgoingMeta, WriteCall, WriteGate};
+use crate::transport::write_gate::{describe, Admit, Deadline, GateReason, OutgoingMeta, Refusal, Waiting, WriteCall, WriteGate};
 use crate::Error;
 
 async fn pair(gate: Arc<dyn WriteGate>) -> (Arc<AsyncTcpSocket>, TcpStream) {
@@ -224,7 +224,10 @@ async fn a_call_keeps_one_deadline_across_every_retry() {
     let started = Instant::now();
     let outcome = write(&socket, &place(8)).await;
     let elapsed = started.elapsed();
-    assert!(matches!(outcome, Err(Error::Refused(_))), "{outcome:?}");
+    assert!(
+        matches!(outcome, Err(Error::Refused(Refusal::Expired { waiting_for: Waiting::Slot }))),
+        "{outcome:?}"
+    );
     assert!(elapsed >= Duration::from_millis(280), "{elapsed:?}");
     assert!(elapsed < Duration::from_millis(900), "the deadline was extended: {elapsed:?}");
     assert_eq!(gate.deadlines.load(Ordering::SeqCst), 1, "a new deadline was asked for");
@@ -235,10 +238,13 @@ async fn a_call_keeps_one_deadline_across_every_retry() {
 
 #[tokio::test]
 async fn a_refusal_hands_no_byte_to_the_socket() {
-    let gate = Scripted::new(|_| soon(), |_| Admit::Refuse("not now"));
+    let gate = Scripted::new(|_| soon(), |_| Admit::Refuse(GateReason { code: 1, text: "not now" }));
     let (socket, mut peer) = pair(gated(&gate)).await;
     let outcome = write(&socket, &place(9)).await;
-    assert!(matches!(outcome, Err(Error::Refused(ref reason)) if reason == "not now"), "{outcome:?}");
+    assert!(
+        matches!(outcome, Err(Error::Refused(Refusal::Gate(GateReason { code: 1, .. })))),
+        "{outcome:?}"
+    );
     socket.shutdown();
     assert!(frames(&mut peer).await.is_empty(), "a refused write reached the peer");
 }
@@ -294,7 +300,15 @@ async fn the_deadline_covers_the_wait_for_the_writer() {
     let outcome = tokio::time::timeout(Duration::from_secs(2), write(&socket, &cancel(11)))
         .await
         .expect("the wait for the writer is bounded by the call's deadline");
-    assert!(matches!(outcome, Err(Error::Refused(_))), "{outcome:?}");
+    assert!(
+        matches!(
+            outcome,
+            Err(Error::Refused(Refusal::Expired {
+                waiting_for: Waiting::Writer
+            }))
+        ),
+        "{outcome:?}"
+    );
     assert!(started.elapsed() < Duration::from_millis(900), "{:?}", started.elapsed());
     assert_eq!(
         gate.admits.load(Ordering::SeqCst),
@@ -327,7 +341,7 @@ async fn no_wait_is_one_try_now() {
     let refused = tokio::time::timeout(Duration::from_secs(1), write(&other, &place(13)))
         .await
         .expect("a write that does not wait is not held");
-    assert!(matches!(refused, Err(Error::Refused(_))), "{refused:?}");
+    assert!(matches!(refused, Err(Error::Refused(Refusal::NoSlot))), "{refused:?}");
     assert!(started.elapsed() < Duration::from_millis(200), "{:?}", started.elapsed());
     assert_eq!(held.admits.load(Ordering::SeqCst), 1);
 
@@ -344,7 +358,11 @@ async fn an_expired_deadline_is_never_tried_even_first() {
     // a way round an expired deadline (ACS 1712).
     let gate = Scripted::new(|_| Deadline::At(Instant::now() - Duration::from_millis(1)), |_| Admit::Write);
     let (socket, mut peer) = pair(gated(&gate)).await;
-    assert!(matches!(write(&socket, &place(14)).await, Err(Error::Refused(_))));
+    let expired = write(&socket, &place(14)).await;
+    assert!(
+        matches!(expired, Err(Error::Refused(Refusal::Expired { waiting_for: Waiting::Start }))),
+        "{expired:?}"
+    );
     assert_eq!(gate.admits.load(Ordering::SeqCst), 0, "an expired write was tried");
     socket.shutdown();
     assert!(frames(&mut peer).await.is_empty());
@@ -448,7 +466,7 @@ async fn a_call_ends_once_however_its_write_ends() {
         })
     };
     ends(|| Admit::Write, soon, "written", once).await;
-    ends(|| Admit::Refuse("test"), soon, "refused", once).await;
+    ends(|| Admit::Refuse(GateReason { code: 1, text: "test" }), soon, "refused", once).await;
     ends(later, || in_ms(200), "past its deadline", once).await;
     ends(later, || Deadline::NoWait, "no wait", once).await;
     ends(later, soon, "closed while waiting", |socket: Arc<AsyncTcpSocket>| {
@@ -471,4 +489,126 @@ async fn a_call_ends_once_however_its_write_ends() {
         })
     })
     .await;
+}
+
+/// A write of 64 MiB the peer does not read: it fills every buffer and holds
+/// the writer's lock until the peer reads.
+fn hold_the_writer(socket: &Arc<AsyncTcpSocket>) -> tokio::task::JoinHandle<Result<(), Error>> {
+    let socket = Arc::clone(socket);
+    tokio::spawn(async move {
+        let body = vec![0_u8; 64 << 20];
+        let meta = describe(&body, None, false);
+        socket.write_frame(&meta, &encode_raw_length(&body)).await
+    })
+}
+
+#[tokio::test]
+async fn a_write_that_does_not_wait_is_refused_as_busy_when_the_writer_is_held() {
+    let gate = Scripted::new(
+        |meta| match meta.message {
+            Some(OutgoingMessages::RequestMarketData) => Deadline::NoWait,
+            _ => soon(),
+        },
+        |_| Admit::Write,
+    );
+    let (socket, _peer) = pair(gated(&gate)).await;
+    let _big = hold_the_writer(&socket);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let busy = write(&socket, b"1\x0011\x00").await;
+    assert!(matches!(busy, Err(Error::Refused(Refusal::Busy))), "{busy:?}");
+    socket.shutdown();
+}
+
+#[tokio::test]
+async fn an_expired_write_names_the_wait_it_ended_after_a_slot_wait() {
+    // First a `Later`; while it waits for a slot, another write takes the
+    // writer's lock and keeps it. The deadline passes waiting for the
+    // writer, not for the slot it waited for before.
+    let asked = Arc::new(AtomicUsize::new(0));
+    let first = Arc::clone(&asked);
+    let gate = Scripted::new(
+        |meta| match meta.order_id {
+            Some(20) => in_ms(600),
+            _ => soon(),
+        },
+        move |meta| {
+            if meta.order_id == Some(20) && first.fetch_add(1, Ordering::SeqCst) == 0 {
+                Admit::Later {
+                    retry_at: Instant::now() + Duration::from_millis(200),
+                }
+            } else {
+                Admit::Write
+            }
+        },
+    );
+    let (socket, _peer) = pair(gated(&gate)).await;
+    let writing = tokio::spawn({
+        let socket = Arc::clone(&socket);
+        async move { write(&socket, &place(20)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _big = hold_the_writer(&socket);
+    let expired = tokio::time::timeout(Duration::from_secs(3), writing)
+        .await
+        .expect("bounded by its deadline")
+        .expect("joins");
+    assert!(
+        matches!(
+            expired,
+            Err(Error::Refused(Refusal::Expired {
+                waiting_for: Waiting::Writer
+            }))
+        ),
+        "{expired:?}"
+    );
+    socket.shutdown();
+}
+
+#[tokio::test]
+async fn an_expired_write_names_the_wait_it_ended_after_a_writer_wait() {
+    // First the writer's lock, held by a write the peer then drains; then
+    // `Later` with no slot before the deadline. The deadline passes waiting
+    // for a slot, not for the writer it waited for before.
+    let gate = Scripted::new(
+        |meta| match meta.order_id {
+            Some(21) => in_ms(1500),
+            _ => soon(),
+        },
+        |meta| {
+            if meta.order_id == Some(21) {
+                Admit::Later {
+                    retry_at: Instant::now() + Duration::from_secs(60),
+                }
+            } else {
+                Admit::Write
+            }
+        },
+    );
+    let (socket, mut peer) = pair(gated(&gate)).await;
+    let big = hold_the_writer(&socket);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let writing = tokio::spawn({
+        let socket = Arc::clone(&socket);
+        async move { write(&socket, &place(21)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The peer reads: the big write finishes and releases the writer.
+    let mut sink = vec![0_u8; 1 << 20];
+    let mut drained = 0_usize;
+    while drained < (64 << 20) {
+        match tokio::time::timeout(Duration::from_secs(5), peer.read(&mut sink)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => drained += n,
+        }
+    }
+    big.await.expect("joins").expect("the big write went out");
+    let expired = tokio::time::timeout(Duration::from_secs(3), writing)
+        .await
+        .expect("bounded by its deadline")
+        .expect("joins");
+    assert!(
+        matches!(expired, Err(Error::Refused(Refusal::Expired { waiting_for: Waiting::Slot }))),
+        "{expired:?}"
+    );
+    socket.shutdown();
 }

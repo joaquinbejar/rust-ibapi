@@ -139,6 +139,8 @@ pub use client::Client;
 #[doc(inline)]
 pub use client::ClientBuilder;
 
+/// Why a write was refused before any byte ([`Error::Refused`]).
+pub use errors::{GateReason, Refusal, Waiting};
 /// The write gate a client can be built with (async only): see
 /// [`ClientBuilder::write_gate`].
 #[cfg(feature = "async")]
