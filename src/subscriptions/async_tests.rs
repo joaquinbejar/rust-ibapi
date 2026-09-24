@@ -375,6 +375,43 @@ async fn test_subscription_cancel() {
     subscription.cancel().await;
 }
 
+/// `try_cancel` says whether the cancel request was written. A write that
+/// fails leaves the subscription not cancelled, so a retry sends it; once
+/// written, it is cancelled and a further call sends nothing more.
+#[tokio::test]
+async fn test_subscription_try_cancel_reports_the_write() {
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (_tx, rx) = broadcast::channel(100);
+    let internal = AsyncInternalSubscription::new(rx);
+    let cancel_fn: CancelFn =
+        Box::new(|_version, _id, _ctx| Ok(crate::messages::encode_protobuf_message(OutgoingMessages::CancelMarketData as i32, &[])));
+    let mut subscription: Subscription<String> = Subscription::with_decoder(
+        internal,
+        message_bus.clone(),
+        |_context, _msg| Ok("test".to_string()),
+        Some(321),
+        None,
+        DecoderContext::default(),
+    );
+    subscription.cancel_fn = Some(Arc::new(cancel_fn));
+
+    message_bus.set_fail_sends(true);
+    assert!(matches!(subscription.try_cancel().await, Err(Error::ConnectionReset)));
+    assert!(
+        !subscription.cancelled.load(Ordering::Relaxed),
+        "a cancel that was not written is not a cancel"
+    );
+    assert!(message_bus.request_messages().is_empty());
+
+    message_bus.set_fail_sends(false);
+    assert!(subscription.try_cancel().await.is_ok());
+    assert!(subscription.cancelled.load(Ordering::Relaxed));
+    assert_eq!(message_bus.request_messages().len(), 1, "written once");
+
+    assert!(subscription.try_cancel().await.is_ok(), "already cancelled");
+    assert_eq!(message_bus.request_messages().len(), 1, "and nothing written again");
+}
+
 #[tokio::test]
 async fn test_subscription_clone() {
     let message_bus = Arc::new(MessageBusStub::default());

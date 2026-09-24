@@ -41,6 +41,28 @@ pub(crate) struct MessageBusStub {
     // pub order_id: i32,
 }
 
+// Stubs whose sends and cancels fail, as on a session that has gone away.
+// Tracked by address, like the order-update tracker below, so the dozens of
+// struct literals of `MessageBusStub` need no new field.
+static FAILING_SENDS: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+impl MessageBusStub {
+    /// Make every send and cancel of this stub fail with
+    /// [`Error::ConnectionReset`], or succeed again.
+    pub fn set_fail_sends(&self, failing: bool) {
+        let mut failing_stubs = FAILING_SENDS.lock().unwrap();
+        if failing {
+            failing_stubs.insert(self as *const _ as usize);
+        } else {
+            failing_stubs.remove(&(self as *const _ as usize));
+        }
+    }
+
+    fn sends_fail(&self) -> bool {
+        FAILING_SENDS.lock().unwrap().contains(&(self as *const _ as usize))
+    }
+}
+
 // Separate tracking for order update subscriptions to maintain backward compatibility
 static ORDER_UPDATE_SUBSCRIPTION_TRACKER: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
@@ -108,6 +130,9 @@ impl MessageBus for MessageBusStub {
     }
 
     fn cancel_subscription(&self, request_id: i32, packet: &[u8]) -> Result<(), Error> {
+        if self.sends_fail() {
+            return Err(Error::ConnectionReset);
+        }
         mock_request(self, Some(request_id), None, packet);
         Ok(())
     }
@@ -241,11 +266,17 @@ impl AsyncMessageBus for MessageBusStub {
     }
 
     async fn send_message(&self, message: Vec<u8>) -> Result<(), Error> {
+        if self.sends_fail() {
+            return Err(Error::ConnectionReset);
+        }
         self.request_messages.write().unwrap().push(message);
         Ok(())
     }
 
     async fn cancel_subscription(&self, _request_id: i32, message: Vec<u8>) -> Result<(), Error> {
+        if self.sends_fail() {
+            return Err(Error::ConnectionReset);
+        }
         self.request_messages.write().unwrap().push(message);
         Ok(())
     }

@@ -326,22 +326,43 @@ impl<T: Send + 'static> Stream for Subscription<T> {
 }
 
 impl<T> Subscription<T> {
-    /// Cancel the subscription
+    /// Cancel the subscription.
+    ///
+    /// Best effort: a cancel request that cannot be written is logged, and the
+    /// subscription is marked cancelled anyway. Use [`try_cancel`](Self::try_cancel)
+    /// to know whether it was written.
     pub async fn cancel(&self) {
+        if let Err(e) = self.try_cancel().await {
+            warn!("error sending cancel message: {e}");
+            self.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Cancel the subscription, and say whether the cancel request was written
+    /// to the session.
+    ///
+    /// IB acknowledges no cancellation of a market-data or streaming request,
+    /// so the written request is the last point a caller can confirm. Returns
+    /// `Ok(())` once it is written, or when the subscription was already
+    /// cancelled or has no cancel request to send. On a write error the
+    /// subscription is **not** marked cancelled, so a later cancel, or the drop,
+    /// tries again.
+    ///
+    /// # Errors
+    /// The error of encoding or writing the cancel request.
+    pub async fn try_cancel(&self) -> Result<(), Error> {
         if self.cancelled.load(Ordering::Relaxed) {
-            return;
+            return Ok(());
         }
-
+        let (Some(message_bus), Some(cancel_fn)) = (&self.message_bus, &self.cancel_fn) else {
+            self.cancelled.store(true, Ordering::Relaxed);
+            return Ok(());
+        };
+        let id = self.request_id.or(self.order_id);
+        let message = cancel_fn(self.context.server_version, id, Some(&self.context))?;
+        message_bus.send_message(message).await?;
         self.cancelled.store(true, Ordering::Relaxed);
-
-        if let (Some(message_bus), Some(cancel_fn)) = (&self.message_bus, &self.cancel_fn) {
-            let id = self.request_id.or(self.order_id);
-            if let Ok(message) = cancel_fn(self.context.server_version, id, Some(&self.context)) {
-                if let Err(e) = message_bus.send_message(message).await {
-                    warn!("error sending cancel message: {e}")
-                }
-            }
-        }
+        Ok(())
     }
 }
 
