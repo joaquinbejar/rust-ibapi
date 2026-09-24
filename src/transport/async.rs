@@ -38,10 +38,174 @@ pub(crate) const BROADCAST_CHANNEL_CAPACITY: usize = 1024;
 /// Cleanup signal for removing channels when subscriptions are dropped
 #[derive(Debug, Clone)]
 pub enum CleanupSignal {
-    Request(i32),
-    Order(i32),
+    Request(i32, ChannelIdentity),
+    Order(i32, ChannelIdentity),
     Shared(OutgoingMessages),
     OrderUpdateStream,
+    /// A registration whose request was never handed back as a subscription:
+    /// its write failed or its future was dropped. See [`Registration`].
+    Withdraw(Withdrawal),
+}
+
+/// Which table a [`Registration`] is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Table {
+    Request,
+    Order,
+}
+
+/// Which channel an entry in a table is: a subscription's cleanup and a
+/// withdrawal act on an entry only if it is still theirs, never on a
+/// successor registered under the same id since.
+pub type ChannelIdentity = broadcast::WeakSender<RoutedItem>;
+
+fn is_entry(channels: &HashMap<i32, BroadcastSender>, id: i32, ours: &ChannelIdentity) -> bool {
+    match (channels.get(&id), ours.upgrade()) {
+        (Some(current), Some(ours)) => current.same_channel(&ours),
+        _ => false,
+    }
+}
+
+/// A subscription has ended: remove its entry if the entry is still its
+/// channel and nothing listens on that channel any more. Another subscription
+/// may share the channel (a clone, or a modify that joined an order's
+/// channel), and a successor may have replaced it; both are left alone.
+fn release(channels: &mut HashMap<i32, BroadcastSender>, id: i32, ours: &ChannelIdentity) {
+    if is_entry(channels, id, ours) && channels.get(&id).is_some_and(|current| current.receiver_count() == 0) {
+        channels.remove(&id);
+    }
+}
+
+/// What undoing a [`Registration`] needs: whose entry it was, and what it
+/// replaced.
+#[derive(Debug, Clone)]
+pub struct Withdrawal {
+    table: Table,
+    id: i32,
+    ours: ChannelIdentity,
+    previous: Option<BroadcastSender>,
+}
+
+impl Withdrawal {
+    /// Undo the registration in `channels`, once its own receiver is gone.
+    ///
+    /// Only an entry that is still ours and that nobody else listens on is
+    /// touched: a successor, a table cleared by a reconnect or a shutdown, and
+    /// a channel another subscription shares are left alone. An entry it
+    /// replaced is put back if anything still listens on it.
+    fn apply(self, channels: &mut HashMap<i32, BroadcastSender>) {
+        if !is_entry(channels, self.id, &self.ours) || channels.get(&self.id).is_some_and(|current| current.receiver_count() > 0) {
+            return;
+        }
+        match self.previous {
+            Some(previous) if previous.receiver_count() > 0 => {
+                channels.insert(self.id, previous);
+            }
+            _ => {
+                channels.remove(&self.id);
+            }
+        }
+    }
+}
+
+/// A response channel registered under a request or order id before its
+/// request is written, so that no answer arrives before it can be routed.
+///
+/// Until [`Registration::keep`], the request has not been handed back as a
+/// subscription, and nothing else will ever release the entry: a write that
+/// fails (a gate's refusal, a closed connection) or a future dropped while it
+/// waits must undo it. [`Registration::withdraw`] does so on the error path;
+/// dropping an armed registration hands the same withdrawal to the bus's
+/// cleanup task, which is what a cancelled future does. Either way the
+/// registration's own receiver goes first.
+struct Registration<'a> {
+    channels: &'a RwLock<HashMap<i32, BroadcastSender>>,
+    cleanup: &'a mpsc::UnboundedSender<CleanupSignal>,
+    receiver: Option<broadcast::Receiver<RoutedItem>>,
+    withdrawal: Option<Withdrawal>,
+}
+
+impl<'a> Registration<'a> {
+    /// A new channel under `id`, replacing whatever was there, as a request
+    /// id has always done. What it replaced comes back if the request is not
+    /// written.
+    async fn replace(
+        channels: &'a RwLock<HashMap<i32, BroadcastSender>>,
+        cleanup: &'a mpsc::UnboundedSender<CleanupSignal>,
+        table: Table,
+        id: i32,
+    ) -> Registration<'a> {
+        let (sender, receiver) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
+        let ours = sender.downgrade();
+        let previous = channels.write().await.insert(id, sender);
+        Registration {
+            channels,
+            cleanup,
+            receiver: Some(receiver),
+            withdrawal: Some(Withdrawal { table, id, ours, previous }),
+        }
+    }
+
+    /// The channel under `id` if something still listens on it, joined with a
+    /// receiver of its own; otherwise a new one. A modify of an order keeps
+    /// the order's existing consumers this way.
+    async fn join(
+        channels: &'a RwLock<HashMap<i32, BroadcastSender>>,
+        cleanup: &'a mpsc::UnboundedSender<CleanupSignal>,
+        table: Table,
+        id: i32,
+    ) -> Registration<'a> {
+        let mut table_guard = channels.write().await;
+        let (ours, receiver) = match table_guard.get(&id) {
+            Some(existing) if existing.receiver_count() > 0 => (existing.downgrade(), existing.subscribe()),
+            _ => {
+                let (sender, receiver) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
+                let ours = sender.downgrade();
+                // Whatever was there had no listener left.
+                table_guard.insert(id, sender);
+                (ours, receiver)
+            }
+        };
+        Registration {
+            channels,
+            cleanup,
+            receiver: Some(receiver),
+            withdrawal: Some(Withdrawal {
+                table,
+                id,
+                ours,
+                previous: None,
+            }),
+        }
+    }
+
+    /// The request was written: the entry stays, released from now on by the
+    /// subscription's own cleanup, and what it replaced goes.
+    fn keep(mut self) -> (broadcast::Receiver<RoutedItem>, ChannelIdentity) {
+        let withdrawal = self.withdrawal.take().expect("armed until kept or withdrawn");
+        let receiver = self.receiver.take().expect("held until kept or withdrawn");
+        (receiver, withdrawal.ours)
+    }
+
+    /// The request was not written: undo the registration now.
+    async fn withdraw(mut self) {
+        drop(self.receiver.take());
+        let mut channels = self.channels.write().await;
+        if let Some(withdrawal) = self.withdrawal.take() {
+            withdrawal.apply(&mut channels);
+        }
+    }
+}
+
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        drop(self.receiver.take());
+        if let Some(withdrawal) = self.withdrawal.take() {
+            // The cleanup task lives as long as the bus; if it has gone, so
+            // have the tables.
+            let _ = self.cleanup.send(CleanupSignal::Withdraw(withdrawal));
+        }
+    }
 }
 
 /// Asynchronous message bus trait
@@ -217,6 +381,11 @@ impl AsyncInternalSubscription {
 /// Send cleanup signal when subscription is dropped
 impl Drop for AsyncInternalSubscription {
     fn drop(&mut self) {
+        // This subscription's receivers go first: the cleanup releases a
+        // channel's entry only once nothing listens on it.
+        let (_, closed) = broadcast::channel(1);
+        self.stream = BroadcastStream::new(closed.resubscribe());
+        self.template_receiver = closed;
         self.send_cleanup_signal();
     }
 }
@@ -306,14 +475,14 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             let mut receiver = cleanup_receiver;
             while let Some(signal) = receiver.recv().await {
                 match signal {
-                    CleanupSignal::Request(request_id) => {
+                    CleanupSignal::Request(request_id, ours) => {
                         let mut channels = request_channels.write().await;
-                        channels.remove(&request_id);
+                        release(&mut channels, request_id, &ours);
                         debug!("Cleaned up request channel for ID: {request_id}");
                     }
-                    CleanupSignal::Order(order_id) => {
+                    CleanupSignal::Order(order_id, ours) => {
                         let mut channels = order_channels.write().await;
-                        channels.remove(&order_id);
+                        release(&mut channels, order_id, &ours);
                         debug!("Cleaned up order channel for ID: {order_id}");
                     }
                     CleanupSignal::Shared(message_type) => {
@@ -325,6 +494,15 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                         let mut stream = order_update_stream.write().await;
                         *stream = None;
                         debug!("Cleaned up order update stream ownership");
+                    }
+                    CleanupSignal::Withdraw(withdrawal) => {
+                        let channels = match withdrawal.table {
+                            Table::Request => &request_channels,
+                            Table::Order => &order_channels,
+                        };
+                        let mut channels = channels.write().await;
+                        debug!("Withdrew an unsent {:?} registration for ID: {}", withdrawal.table, withdrawal.id);
+                        withdrawal.apply(&mut channels);
                     }
                 }
             }
@@ -730,36 +908,34 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
 #[async_trait]
 impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
     async fn send_request(&self, request_id: i32, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
-        let (sender, receiver) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
+        let registration = Registration::replace(&self.request_channels, &self.cleanup_sender, Table::Request, request_id).await;
 
-        {
-            let mut channels = self.request_channels.write().await;
-            channels.insert(request_id, sender);
+        if let Err(error) = self.connection.write_message_for(&message, Some(request_id)).await {
+            registration.withdraw().await;
+            return Err(error);
         }
-
-        self.connection.write_message_for(&message, Some(request_id)).await?;
+        let (receiver, ours) = registration.keep();
 
         Ok(AsyncInternalSubscription::with_cleanup(
             receiver,
             self.cleanup_sender.clone(),
-            CleanupSignal::Request(request_id),
+            CleanupSignal::Request(request_id, ours),
         ))
     }
 
     async fn send_order_request(&self, order_id: i32, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
-        let (sender, receiver) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
+        let registration = Registration::join(&self.order_channels, &self.cleanup_sender, Table::Order, order_id).await;
 
-        {
-            let mut channels = self.order_channels.write().await;
-            channels.insert(order_id, sender);
+        if let Err(error) = self.connection.write_message(&message).await {
+            registration.withdraw().await;
+            return Err(error);
         }
-
-        self.connection.write_message(&message).await?;
+        let (receiver, ours) = registration.keep();
 
         Ok(AsyncInternalSubscription::with_cleanup(
             receiver,
             self.cleanup_sender.clone(),
-            CleanupSignal::Order(order_id),
+            CleanupSignal::Order(order_id, ours),
         ))
     }
 
@@ -896,3 +1072,7 @@ mod close_tests;
 #[cfg(test)]
 #[path = "async_gate_tests.rs"]
 mod gate_tests;
+
+#[cfg(test)]
+#[path = "async_bus_gate_tests.rs"]
+mod bus_gate_tests;
