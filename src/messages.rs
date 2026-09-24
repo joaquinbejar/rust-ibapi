@@ -458,6 +458,11 @@ pub(crate) fn request_id_index(kind: IncomingMessages) -> Option<usize> {
         IncomingMessages::TickPrice => Some(2),
         IncomingMessages::TickReqParams => Some(1),
         IncomingMessages::TickSize => Some(2),
+        // IB's marketDataType(reqId, type) names the subscription it is for:
+        // the type IB actually serves that request. Without an index it was
+        // routed to the shared channel of reqMarketDataType, and no market
+        // data subscription ever received it.
+        IncomingMessages::MarketDataType => Some(2),
         IncomingMessages::TickSnapshotEnd => Some(2),
         IncomingMessages::TickString => Some(2),
         IncomingMessages::WshEventData => Some(1),
