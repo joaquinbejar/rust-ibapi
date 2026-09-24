@@ -8,6 +8,7 @@ use std::task::{Context, Poll};
 use futures::stream::Stream;
 use log::{debug, warn};
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use super::common::{filter_notice, process_decode_result, DecoderContext, ProcessingResult, RoutedItem, SubscriptionItem};
 use super::StreamDecoder;
@@ -264,7 +265,14 @@ impl<T: Send + 'static> Stream for Subscription<T> {
                     // executor between immediately-available items.
                     let routed = match Pin::new(&mut subscription.stream).poll_next(cx) {
                         Poll::Ready(Some(Ok(item))) => item,
-                        Poll::Ready(Some(Err(_lagged))) => continue, // skip BroadcastStream lag
+                        // Messages were dropped. What was delivered is not the
+                        // whole answer, and an end marker after the loss must
+                        // not make it look complete: end here, not completed.
+                        Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(skipped)))) => {
+                            warn!("subscription lagged, dropped {skipped} messages; ending it");
+                            stream_ended.store(true, Ordering::Relaxed);
+                            return Poll::Ready(Some(Err(Error::Lagged(skipped))));
+                        }
                         Poll::Ready(None) => return Poll::Ready(None),
                         Poll::Pending => return Poll::Pending,
                     };

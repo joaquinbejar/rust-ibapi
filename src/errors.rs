@@ -102,6 +102,15 @@ pub enum Error {
     #[error("UnexpectedEndOfStream")]
     UnexpectedEndOfStream,
 
+    /// The subscription's channel overflowed and dropped this many messages.
+    ///
+    /// Whatever the subscription delivered before is incomplete, and an end
+    /// marker read after the loss would not make it complete, so the
+    /// subscription ends here: it yields this error once and then `None`,
+    /// and never reports `completed()`.
+    #[error("Lagged: {0} messages were dropped; the answer is incomplete")]
+    Lagged(u64),
+
     /// An IB notice frame (TWS error/warning/system message) received in
     /// response to a request. Carries the full typed [`Notice`] — code,
     /// message, optional timestamp, and advanced-order-reject JSON.
@@ -204,6 +213,7 @@ impl Clone for Error {
             Error::EndOfStream => Error::EndOfStream,
             Error::UnexpectedResponse(m) => Error::UnexpectedResponse(m.clone()),
             Error::UnexpectedEndOfStream => Error::UnexpectedEndOfStream,
+            Error::Lagged(skipped) => Error::Lagged(*skipped),
             Error::Notice(n) => Error::Notice(n.clone()),
             Error::AlreadySubscribed => Error::AlreadySubscribed,
             Error::HistoricalParseError(e) => Error::HistoricalParseError(e.clone()),

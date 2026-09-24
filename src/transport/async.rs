@@ -14,6 +14,7 @@ use log::{debug, error, info, warn};
 use tokio::sync::{broadcast, mpsc, Notify, RwLock};
 use tokio::task;
 use tokio::time::Duration;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::connection::r#async::AsyncConnection;
@@ -80,6 +81,10 @@ pub struct AsyncInternalSubscription {
     cleanup_sender: Option<mpsc::UnboundedSender<CleanupSignal>>,
     cleanup_signal: Option<CleanupSignal>,
     cleanup_sent: bool,
+    /// Set once the channel dropped messages. The subscription has then
+    /// ended: nothing read after a loss is delivered, because an answer with
+    /// a hole in it is not the answer, whatever end marker follows.
+    lagged: bool,
 }
 
 impl Clone for AsyncInternalSubscription {
@@ -95,6 +100,7 @@ impl Clone for AsyncInternalSubscription {
             cleanup_sender: self.cleanup_sender.clone(),
             cleanup_signal: self.cleanup_signal.clone(),
             cleanup_sent: false, // Each clone should handle its own cleanup
+            lagged: false,
         }
     }
 }
@@ -120,6 +126,7 @@ impl AsyncInternalSubscription {
             cleanup_sender: None,
             cleanup_signal: None,
             cleanup_sent: false,
+            lagged: false,
         }
     }
 
@@ -135,10 +142,19 @@ impl AsyncInternalSubscription {
             cleanup_sender: Some(cleanup_sender),
             cleanup_signal: Some(cleanup_signal),
             cleanup_sent: false,
+            lagged: false,
         }
     }
 
+    /// The next response.
+    ///
+    /// A channel that dropped messages yields [`Error::Lagged`] once and then
+    /// `None`: a request that collects rows until its end marker must not
+    /// return the rows around a hole as the whole answer.
     pub async fn next(&mut self) -> Option<Result<ResponseMessage, Error>> {
+        if self.lagged {
+            return None;
+        }
         loop {
             match self.stream.next().await? {
                 Ok(item) => {
@@ -146,7 +162,11 @@ impl AsyncInternalSubscription {
                         return Some(legacy);
                     }
                 }
-                Err(_lagged) => continue,
+                Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                    warn!("subscription channel lagged, dropped {skipped} messages; ending it");
+                    self.lagged = true;
+                    return Some(Err(Error::Lagged(skipped)));
+                }
             }
         }
     }

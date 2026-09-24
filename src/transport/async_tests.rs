@@ -808,3 +808,18 @@ async fn test_a_socket_failure_with_auto_reconnect_attempts_a_reconnect() {
     let mb: &dyn AsyncMessageBus = bus.as_ref();
     mb.request_shutdown_sync();
 }
+
+#[tokio::test]
+async fn test_internal_next_reports_a_lag_once_and_then_ends() {
+    // What one-shot collectors (contract details and the like) read through.
+    // They collect rows until the end marker; a lag skipped here would have
+    // them return the rows around the hole as the whole answer.
+    let (tx, rx) = tokio::sync::broadcast::channel(1);
+    let mut internal = AsyncInternalSubscription::new(rx);
+    tx.send(crate::messages::ResponseMessage::from("10\x001\0").into()).unwrap();
+    tx.send(crate::messages::ResponseMessage::from("52\x001\0").into()).unwrap();
+
+    let first = internal.next().await;
+    assert!(matches!(first, Some(Err(Error::Lagged(1)))), "a lost row was not reported: {first:?}");
+    assert!(internal.next().await.is_none(), "the end marker after the loss was delivered");
+}

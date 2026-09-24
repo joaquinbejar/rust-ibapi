@@ -693,3 +693,45 @@ async fn pre_decoded_subscription_polls() {
     // After the sender drops, the stream is exhausted.
     assert!(subscription.next().await.is_none());
 }
+
+/// A decoder for the lag tests: `0` is the end marker, anything else a row.
+fn row_or_end(_context: &DecoderContext, message: &mut ResponseMessage) -> Result<String, Error> {
+    if message.peek_int(0)? == 0 {
+        Err(Error::EndOfStream)
+    } else {
+        Ok("row".to_owned())
+    }
+}
+
+#[tokio::test]
+async fn test_lag_before_the_end_marker_ends_the_subscription_not_completed() {
+    // A channel of one: the row is overwritten by the end marker before it is
+    // read. Before the fix the lag was skipped, the marker read, and the
+    // empty answer reported as completed.
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (tx, rx) = broadcast::channel(1);
+    let internal = AsyncInternalSubscription::new(rx);
+    let mut subscription: Subscription<String> = Subscription::with_decoder(internal, message_bus, row_or_end, None, None, DecoderContext::default());
+    tx.send(ResponseMessage::from("1\0").into()).unwrap();
+    tx.send(ResponseMessage::from("0\0").into()).unwrap();
+
+    let first = subscription.next().await;
+    assert!(matches!(first, Some(Err(Error::Lagged(1)))), "a lost row was not reported: {first:?}");
+    assert!(subscription.next().await.is_none(), "the subscription went on after a loss");
+    assert!(!subscription.completed(), "an answer with a lost row was reported complete");
+}
+
+#[tokio::test]
+async fn test_a_subscription_that_did_not_lag_still_completes() {
+    // The control: the same rows through a channel that holds them all.
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (tx, rx) = broadcast::channel(4);
+    let internal = AsyncInternalSubscription::new(rx);
+    let mut subscription: Subscription<String> = Subscription::with_decoder(internal, message_bus, row_or_end, None, None, DecoderContext::default());
+    tx.send(ResponseMessage::from("1\0").into()).unwrap();
+    tx.send(ResponseMessage::from("0\0").into()).unwrap();
+
+    assert!(matches!(subscription.next().await, Some(Ok(SubscriptionItem::Data(_)))));
+    assert!(subscription.next().await.is_none());
+    assert!(subscription.completed());
+}
