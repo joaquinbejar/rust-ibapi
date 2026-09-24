@@ -452,7 +452,12 @@ async fn a_call_ends_once_however_its_write_ends() {
         let calls = Calls::new(&gate);
         let (socket, _peer) = pair(calls.clone()).await;
         let handle = run(Arc::clone(&socket));
-        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await.expect("the write ends");
+        // The task's own assertions (the close, the abort) must not be lost:
+        // a panic in it fails here, not only a wrong count.
+        tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("the write ends")
+            .expect("task did not panic");
         assert_eq!((calls.begun(), calls.ended()), (1, 1), "{how}");
     }
     fn later() -> Admit {
