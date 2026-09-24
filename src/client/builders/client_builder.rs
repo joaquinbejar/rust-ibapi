@@ -53,6 +53,9 @@ pub(super) struct BuilderState {
     pub(super) startup_callback: Option<Arc<dyn Fn(StartupMessage) + Send + Sync>>,
     /// `true` turns the transport's own reconnect loop off (async only).
     pub(super) no_auto_reconnect: bool,
+    /// Asked at every write, under the writer's lock (async only).
+    #[cfg(feature = "async")]
+    pub(super) write_gate: Option<Arc<dyn crate::transport::write_gate::WriteGate>>,
 }
 
 /// Output of [`BuilderState::validate`]: same fields with `address` and
@@ -64,6 +67,8 @@ pub(super) struct ValidatedPieces {
     pub(super) tcp_no_delay: bool,
     pub(super) startup_callback: Option<Arc<dyn Fn(StartupMessage) + Send + Sync>>,
     pub(super) no_auto_reconnect: bool,
+    #[cfg(feature = "async")]
+    pub(super) write_gate: Option<Arc<dyn crate::transport::write_gate::WriteGate>>,
 }
 
 impl BuilderState {
@@ -78,6 +83,8 @@ impl BuilderState {
             tcp_no_delay: self.tcp_no_delay,
             startup_callback: self.startup_callback,
             no_auto_reconnect: self.no_auto_reconnect,
+            #[cfg(feature = "async")]
+            write_gate: self.write_gate,
         })
     }
 }
@@ -359,6 +366,17 @@ pub mod async_impl {
             self
         }
 
+        /// Ask `gate` at every write, under the connection's writer lock and
+        /// before the first byte (see [`WriteGate`](crate::WriteGate)).
+        ///
+        /// A refused write fails with [`Error::Refused`](crate::Error::Refused)
+        /// having sent nothing. The gate never makes a writer wait while
+        /// holding the lock.
+        pub fn write_gate(mut self, gate: Arc<dyn crate::WriteGate>) -> Self {
+            self.state.write_gate = Some(gate);
+            self
+        }
+
         /// Establish the connection and return a [`Client`].
         ///
         /// Handshake-time notices are not surfaced to the caller — see
@@ -421,6 +439,7 @@ pub mod async_impl {
                 pieces.startup_callback,
                 sender,
                 !pieces.no_auto_reconnect,
+                pieces.write_gate,
             )
             .await
         }

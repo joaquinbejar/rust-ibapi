@@ -109,8 +109,9 @@ impl Client {
         startup_callback: Option<Arc<dyn Fn(StartupMessage) + Send + Sync>>,
         notice_sender: broadcast::Sender<Notice>,
         auto_reconnect: bool,
+        write_gate: Option<Arc<dyn crate::transport::write_gate::WriteGate>>,
     ) -> Result<Client, Error> {
-        let connection = AsyncConnection::with_pieces(address, client_id, tcp_no_delay, startup_callback, notice_sender).await?;
+        let connection = AsyncConnection::with_pieces(address, client_id, tcp_no_delay, startup_callback, notice_sender, write_gate).await?;
         let connection_metadata = connection.connection_metadata().await;
 
         let message_bus = Arc::new(AsyncTcpMessageBus::new(connection)?);

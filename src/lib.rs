@@ -139,6 +139,11 @@ pub use client::Client;
 #[doc(inline)]
 pub use client::ClientBuilder;
 
+/// The write gate a client can be built with (async only): see
+/// [`ClientBuilder::write_gate`].
+#[cfg(feature = "async")]
+pub use transport::write_gate::{Admit, Deadline, OutgoingMeta, WriteGate};
+
 #[doc(inline)]
 pub use messages::{IncomingMessages, Notice, NoticeCategory, OutgoingMessages};
 

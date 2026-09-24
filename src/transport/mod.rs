@@ -23,6 +23,9 @@ pub mod sync;
 #[cfg(feature = "async")]
 pub mod r#async;
 
+#[cfg(feature = "async")]
+pub(crate) mod write_gate;
+
 // Internal channel envelope shared across sync/async transports.
 #[cfg(any(feature = "sync", feature = "async"))]
 pub(crate) use crate::subscriptions::common::RoutedItem;

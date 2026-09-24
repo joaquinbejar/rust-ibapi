@@ -13,7 +13,7 @@ use crate::Error;
 async fn pair() -> (AsyncTcpSocket, TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("local address").to_string();
-    let (socket, accepted) = tokio::join!(AsyncTcpSocket::connect(&address, true), listener.accept());
+    let (socket, accepted) = tokio::join!(AsyncTcpSocket::connect(&address, true, None), listener.accept());
     (socket.expect("connects"), accepted.expect("accepts").0)
 }
 

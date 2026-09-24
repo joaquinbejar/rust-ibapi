@@ -96,6 +96,12 @@ pub enum Error {
     #[error("Closed: the connection is closed and the message was not sent")]
     Closed,
 
+    /// The client's write gate refused this message, or its deadline passed,
+    /// **before any byte of it was handed to the socket**: it was not sent.
+    /// The same guarantee as [`Error::Closed`].
+    #[error("Refused: the write gate did not let the message go out ({0})")]
+    Refused(String),
+
     /// Reached end of data stream.
     #[error("EndOfStream")]
     EndOfStream,
@@ -220,6 +226,7 @@ impl Clone for Error {
             Error::Cancelled => Error::Cancelled,
             Error::Shutdown => Error::Shutdown,
             Error::Closed => Error::Closed,
+            Error::Refused(reason) => Error::Refused(reason.clone()),
             Error::EndOfStream => Error::EndOfStream,
             Error::UnexpectedResponse(m) => Error::UnexpectedResponse(m.clone()),
             Error::UnexpectedEndOfStream => Error::UnexpectedEndOfStream,

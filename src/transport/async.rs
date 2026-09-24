@@ -737,7 +737,7 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
             channels.insert(request_id, sender);
         }
 
-        self.connection.write_message(&message).await?;
+        self.connection.write_message_for(&message, Some(request_id)).await?;
 
         Ok(AsyncInternalSubscription::with_cleanup(
             receiver,
@@ -790,7 +790,7 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
     }
 
     async fn cancel_subscription(&self, request_id: i32, message: Vec<u8>) -> Result<(), Error> {
-        self.connection.write_message(&message).await?;
+        self.connection.write_message_for(&message, Some(request_id)).await?;
 
         // Single write lock: the previous version held a read guard while
         // awaiting the write upgrade and self-deadlocked on the same task.
@@ -892,3 +892,7 @@ mod tests;
 #[cfg(test)]
 #[path = "async_close_tests.rs"]
 mod close_tests;
+
+#[cfg(test)]
+#[path = "async_gate_tests.rs"]
+mod gate_tests;

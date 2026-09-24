@@ -1,6 +1,6 @@
 //! Asynchronous connection implementation
 
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 
 use log::{debug, info};
@@ -37,6 +37,8 @@ pub struct AsyncConnection<S: AsyncStream = AsyncTcpSocket> {
     /// `self.connection.notice_sender`) and any pre-bound `NoticeStream` the
     /// user obtained from `ClientBuilder::connect_with_notice_stream`.
     pub(crate) notice_sender: broadcast::Sender<Notice>,
+    /// While the connect handshake runs: a write gate is told so.
+    handshaking: AtomicBool,
 }
 
 impl<S: AsyncStream> std::fmt::Debug for AsyncConnection<S> {
@@ -61,8 +63,9 @@ impl AsyncConnection<AsyncTcpSocket> {
         tcp_no_delay: bool,
         startup_callback: Option<Arc<dyn Fn(StartupMessage) + Send + Sync>>,
         notice_sender: broadcast::Sender<Notice>,
+        write_gate: Option<Arc<dyn crate::transport::write_gate::WriteGate>>,
     ) -> Result<Self, Error> {
-        let socket = AsyncTcpSocket::connect(address, tcp_no_delay).await?;
+        let socket = AsyncTcpSocket::connect(address, tcp_no_delay, write_gate).await?;
         let connection = Self::with_socket(socket, client_id, startup_callback, notice_sender);
         connection.establish_connection().await?;
         Ok(connection)
@@ -88,6 +91,7 @@ impl<S: AsyncStream> AsyncConnection<S> {
             connection_handler: ConnectionHandler::default(),
             startup_callback,
             notice_sender,
+            handshaking: AtomicBool::new(false),
         }
     }
 
@@ -158,19 +162,29 @@ impl<S: AsyncStream> AsyncConnection<S> {
 
     /// Establish connection to TWS
     pub(crate) async fn establish_connection(&self) -> Result<(), Error> {
-        self.handshake().await?;
-        require_protobuf_support(self.server_version())?;
-        self.start_api().await?;
-        self.receive_account_info().await?;
-        Ok(())
+        self.handshaking.store(true, Ordering::Release);
+        let established = async {
+            self.handshake().await?;
+            require_protobuf_support(self.server_version())?;
+            self.start_api().await?;
+            self.receive_account_info().await
+        }
+        .await;
+        self.handshaking.store(false, Ordering::Release);
+        established
     }
 
     /// Write a protobuf message to the connection
     pub(crate) async fn write_message(&self, data: &[u8]) -> Result<(), Error> {
+        self.write_message_for(data, None).await
+    }
+
+    /// [`AsyncConnection::write_message`], for a request sent with an id.
+    pub(crate) async fn write_message_for(&self, data: &[u8], request_id: Option<i32>) -> Result<(), Error> {
         self.recorder.record_request(data);
         debug!("-> {:?}", data);
 
-        self.write_raw(data).await
+        self.write_raw_for(data, request_id).await
     }
 
     /// Read a message from the connection
@@ -200,8 +214,13 @@ impl<S: AsyncStream> AsyncConnection<S> {
     /// [`Error::Closed`] means nothing was sent. Any other error may come
     /// after some bytes reached the socket, and is ambiguous.
     pub(crate) async fn write_raw(&self, data: &[u8]) -> Result<(), Error> {
+        self.write_raw_for(data, None).await
+    }
+
+    async fn write_raw_for(&self, data: &[u8], request_id: Option<i32>) -> Result<(), Error> {
+        let meta = crate::transport::write_gate::describe(data, request_id, self.handshaking.load(Ordering::Acquire));
         let packet = encode_raw_length(data);
-        self.socket.write_all(&packet).await?;
+        self.socket.write_frame(&meta, &packet).await?;
         Ok(())
     }
 
@@ -210,7 +229,9 @@ impl<S: AsyncStream> AsyncConnection<S> {
         let handshake = self.connection_handler.format_handshake();
         debug!("-> handshake: {handshake:?}");
 
-        self.socket.write_all(&handshake).await?;
+        // The version prefix: no message id, part of the handshake.
+        let meta = crate::transport::write_gate::describe(&[], None, true);
+        self.socket.write_frame(&meta, &handshake).await?;
 
         // Read handshake response as raw text, bypassing parse_raw_message
         // which would misinterpret it as binary when server_version >= PROTOBUF (on reconnect).
