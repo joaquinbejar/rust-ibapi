@@ -397,6 +397,86 @@ mod tick_price_tests {
     }
 }
 
+mod tick_presence_and_text_tests {
+    //! What ib-engine needs from a tick beyond its `f64`s: whether the message
+    //! carried a price at all, and a size's text exactly as IB sent it.
+    use super::*;
+
+    fn price_tick(price: Option<f64>, size: Option<&str>) -> Vec<u8> {
+        crate::proto::TickPrice {
+            req_id: Some(9000),
+            tick_type: Some(1),
+            price,
+            size: size.map(str::to_owned),
+            attr_mask: None,
+        }
+        .encode_to_vec()
+    }
+
+    #[test]
+    fn a_message_without_a_price_says_so_rather_than_reporting_zero() {
+        match decode_tick_price_proto(&price_tick(None, Some("0"))).expect("decode failed") {
+            TickTypes::PriceSize(ps) => {
+                assert!(!ps.price_present);
+                assert_eq!(ps.price, 0.0, "the f64 still defaults");
+                assert_eq!(ps.size_text.as_deref(), Some("0"));
+            }
+            other => panic!("expected PriceSize, got {other:?}"),
+        }
+        match decode_tick_price_proto(&price_tick(None, None)).expect("decode failed") {
+            TickTypes::Price(tp) => assert!(!tp.price_present),
+            other => panic!("expected Price, got {other:?}"),
+        }
+        match decode_tick_price_proto(&price_tick(Some(0.0), Some("7"))).expect("decode failed") {
+            TickTypes::PriceSize(ps) => {
+                assert!(ps.price_present, "a zero price that was sent is present");
+                assert_eq!(ps.size_text.as_deref(), Some("7"));
+            }
+            other => panic!("expected PriceSize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_size_keeps_its_text_exactly_as_sent() {
+        let text = "123.456789012345678901";
+        match decode_tick_price_proto(&price_tick(Some(1.5), Some(text))).expect("decode failed") {
+            TickTypes::PriceSize(ps) => assert_eq!(ps.size_text.as_deref(), Some(text)),
+            other => panic!("expected PriceSize, got {other:?}"),
+        }
+        let size_tick = crate::proto::TickSize {
+            req_id: Some(9000),
+            tick_type: Some(0),
+            size: Some("0.30000000000000004".to_owned()),
+        }
+        .encode_to_vec();
+        let decoded = decode_tick_size_proto(&size_tick).expect("decode failed");
+        assert_eq!(decoded.size_text.as_deref(), Some("0.30000000000000004"));
+    }
+
+    #[test]
+    fn an_unset_size_has_no_text() {
+        let unset = f64::MAX.to_string();
+        match decode_tick_price_proto(&price_tick(Some(1.5), Some(&unset))).expect("decode failed") {
+            TickTypes::Price(tp) => assert!(tp.price_present, "no size companion when the size is unset"),
+            other => panic!("expected Price, got {other:?}"),
+        }
+        let size_tick = crate::proto::TickSize {
+            req_id: Some(9000),
+            tick_type: Some(0),
+            size: Some(unset),
+        }
+        .encode_to_vec();
+        assert_eq!(decode_tick_size_proto(&size_tick).expect("decode failed").size_text, None);
+        let empty = crate::proto::TickSize {
+            req_id: Some(9000),
+            tick_type: Some(0),
+            size: None,
+        }
+        .encode_to_vec();
+        assert_eq!(decode_tick_size_proto(&empty).expect("decode failed").size_text, None);
+    }
+}
+
 mod tick_size_tests {
     use super::*;
 

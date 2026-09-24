@@ -10,7 +10,8 @@ use crate::messages::{IncomingMessages, Notice, OutgoingMessages, ResponseMessag
 ///
 /// Subscriptions yield `Result<SubscriptionItem<T>, Error>` items. `Data(T)` is
 /// the decoded payload; `Notice` is a non-fatal IB notice (warning codes
-/// 2100..=2169) bound to this subscription — the stream stays open. Use the
+/// 2100..=2169, or the market-data information codes 10167 and 10090) bound to
+/// this subscription — the stream stays open. Use the
 /// `filter_data` adapter on the `Subscription` (sync: via `SubscriptionItemIterExt`;
 /// async: via `SubscriptionItemStreamExt`) when you only care about data and
 /// want notices logged automatically.
@@ -18,7 +19,8 @@ use crate::messages::{IncomingMessages, Notice, OutgoingMessages, ResponseMessag
 pub enum SubscriptionItem<T> {
     /// A successfully decoded payload from the subscription stream.
     Data(T),
-    /// A non-fatal IB notice (warning codes 2100..=2169) bound to this subscription.
+    /// A non-fatal IB notice (warning codes 2100..=2169, or market-data
+    /// information 10167 and 10090) bound to this subscription.
     /// Receiving a notice does not terminate the stream.
     Notice(Notice),
 }

@@ -217,12 +217,20 @@ pub(crate) fn decode_tick_request_parameters_proto(bytes: &[u8]) -> Result<TickR
     })
 }
 
+/// A size's text exactly as IB sent it, when it is a set value: the same
+/// condition under which the `f64` beside it is reported.
+fn reported_text(opt: &Option<String>) -> Option<String> {
+    optional_string_f64(opt).and(opt.clone())
+}
+
 pub(crate) fn decode_tick_price_proto(bytes: &[u8]) -> Result<TickTypes, Error> {
     let msg = crate::proto::TickPrice::decode(bytes)?;
 
     let tick_type = TickType::from(msg.tick_type.unwrap_or_default());
+    let price_present = msg.price.is_some();
     let price = msg.price.unwrap_or_default();
     let size = optional_string_f64(&msg.size);
+    let size_text = reported_text(&msg.size);
     let attr_mask = msg.attr_mask.unwrap_or_default();
 
     let attributes = TickAttribute {
@@ -245,14 +253,17 @@ pub(crate) fn decode_tick_price_proto(bytes: &[u8]) -> Result<TickTypes, Error> 
         (TickType::Unknown, _) | (_, None) => Ok(TickTypes::Price(TickPrice {
             tick_type,
             price,
+            price_present,
             attributes,
         })),
         (size_tick_type, Some(size)) => Ok(TickTypes::PriceSize(TickPriceSize {
             price_tick_type: tick_type,
             price,
+            price_present,
             attributes,
             size_tick_type,
             size,
+            size_text,
         })),
     }
 }
@@ -263,6 +274,7 @@ pub(crate) fn decode_tick_size_proto(bytes: &[u8]) -> Result<TickSize, Error> {
     Ok(TickSize {
         tick_type: TickType::from(msg.tick_type.unwrap_or_default()),
         size: parse_f64(&msg.size),
+        size_text: reported_text(&msg.size),
     })
 }
 

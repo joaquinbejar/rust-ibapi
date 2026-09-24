@@ -1404,6 +1404,16 @@ pub const ORDER_CANCELLED_CODE: i32 = 202;
 /// Range of error codes that are considered warnings (2100-2169).
 pub const WARNING_CODE_RANGE: std::ops::RangeInclusive<i32> = 2100..=2169;
 
+/// Market-data codes IB sends as information about a subscription that stays
+/// open, not as its end:
+/// - 10167: requested market data is not subscribed; displaying delayed data.
+/// - 10090: part of the requested market data is not subscribed; the
+///   subscription-independent ticks are still active.
+///
+/// Delivered as notices, so a consumer that treats an error as the end of the
+/// subscription (and cancels, or requests again) does not do so for each one.
+pub const MARKET_DATA_NOTICE_CODES: [i32; 2] = [10167, 10090];
+
 /// System message codes indicating connectivity status.
 /// - 1100: Connectivity lost
 /// - 1101: Connectivity restored, market data lost (resubscribe needed)
@@ -1534,6 +1544,12 @@ impl Notice {
     /// Returns `true` if this is a warning message (codes 2100-2169).
     pub fn is_warning(&self) -> bool {
         WARNING_CODE_RANGE.contains(&self.code)
+    }
+
+    /// Returns `true` if this is informational market-data text about a
+    /// subscription that stays open ([`MARKET_DATA_NOTICE_CODES`]).
+    pub fn is_market_data_notice(&self) -> bool {
+        MARKET_DATA_NOTICE_CODES.contains(&self.code)
     }
 
     /// Returns `true` if this is a system/connectivity message (codes 1100-1102, 1300).

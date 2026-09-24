@@ -394,8 +394,12 @@ impl StreamDecoder<TickTypes> for TickTypes {
 pub struct TickPrice {
     /// Type of price tick (bid, ask, last, etc.).
     pub tick_type: TickType,
-    /// The price value.
+    /// The price value. `0.0` when the message carried no price: see
+    /// [`price_present`](Self::price_present).
     pub price: f64,
+    /// Whether the message carried a price at all. A missing price decodes as
+    /// `0.0`, which a consumer must not take for a zero price.
+    pub price_present: bool,
     /// Additional attributes for the price tick.
     pub attributes: TickAttribute,
 }
@@ -420,6 +424,10 @@ pub struct TickSize {
     pub tick_type: TickType,
     /// The size value.
     pub size: f64,
+    /// The size exactly as IB sent it, as decimal text, when it sent one that
+    /// is set. IB sends sizes as decimal text; `size` is that text parsed into
+    /// an `f64`, which can round it.
+    pub size_text: Option<String>,
 }
 
 /// Combined price and size tick data.
@@ -428,14 +436,19 @@ pub struct TickSize {
 pub struct TickPriceSize {
     /// Type of price tick.
     pub price_tick_type: TickType,
-    /// The price value.
+    /// The price value. `0.0` when the message carried no price: see
+    /// [`price_present`](Self::price_present).
     pub price: f64,
+    /// Whether the message carried a price at all.
+    pub price_present: bool,
     /// Price tick attributes.
     pub attributes: TickAttribute,
     /// Type of size tick.
     pub size_tick_type: TickType,
     /// The size value.
     pub size: f64,
+    /// The size exactly as IB sent it, as decimal text.
+    pub size_text: Option<String>,
 }
 
 /// String-based tick data.

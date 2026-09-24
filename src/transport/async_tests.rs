@@ -372,6 +372,55 @@ async fn test_subscription_notice_delivery_request_keyed() {
     }
 }
 
+/// Market-data information (10167, "displaying delayed market data")
+/// repeated on a subscription: each arrives as a notice, the stream stays
+/// open, data keeps flowing, and nothing is sent to the Gateway because of it.
+/// As a terminal error each one would end the subscription, and a consumer
+/// that requested again on every end would loop.
+#[tokio::test]
+async fn test_repeated_market_data_notice_keeps_the_subscription_and_sends_nothing() {
+    let (stream, bus, mut subscription) = make_request_subscription(42).await;
+    let sent_before = stream.captured().len();
+
+    for _ in 0..3 {
+        stream.push_inbound(body(
+            "4|2|42|10167|Requested market data is not subscribed. Displaying delayed market data.|",
+        ));
+        bus.read_and_route_message().await.unwrap();
+        match next_item(&mut subscription).await {
+            Some(Ok(SubscriptionItem::Notice(notice))) => {
+                assert_eq!(notice.code, 10167);
+                assert!(notice.is_market_data_notice());
+            }
+            other => panic!("expected SubscriptionItem::Notice, got {other:?}"),
+        }
+    }
+
+    stream.push_inbound(body("89|42|payload|"));
+    bus.read_and_route_message().await.unwrap();
+    match next_item(&mut subscription).await {
+        Some(Ok(SubscriptionItem::Data(_))) => {}
+        other => panic!("expected SubscriptionItem::Data, got {other:?}"),
+    }
+    assert_eq!(stream.captured().len(), sent_before, "no cancel and no new request was sent");
+}
+
+/// A market-data refusal (10168, delayed data not enabled) still ends the
+/// subscription: only the informational codes became notices.
+#[tokio::test]
+async fn test_market_data_refusal_still_terminates() {
+    let (stream, bus, mut subscription) = make_request_subscription(42).await;
+    stream.push_inbound(body(
+        "4|2|42|10168|Requested market data is not subscribed. Delayed market data is not enabled.|",
+    ));
+    bus.read_and_route_message().await.unwrap();
+    match next_item(&mut subscription).await {
+        Some(Err(Error::Notice(notice))) => assert_eq!(notice.code, 10168),
+        other => panic!("expected Some(Err(Error::Notice)), got {other:?}"),
+    }
+    assert!(next_item(&mut subscription).await.is_none());
+}
+
 /// Hard error (code 200) surfaces as `Some(Err(_))`; subsequent reads return `None`.
 #[tokio::test]
 async fn test_subscription_hard_error_terminates_stream() {

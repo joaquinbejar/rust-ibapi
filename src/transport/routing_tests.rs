@@ -241,6 +241,14 @@ fn test_is_warning_error() {
     assert!(!is_warning_error(2170));
     assert!(!is_warning_error(200));
     assert!(!is_warning_error(2200));
+
+    // Market-data information about a subscription that stays open.
+    assert!(is_warning_error(10167));
+    assert!(is_warning_error(10090));
+    // Market-data refusals still end the subscription.
+    assert!(!is_warning_error(354));
+    assert!(!is_warning_error(10089));
+    assert!(!is_warning_error(10168));
 }
 
 #[test]
