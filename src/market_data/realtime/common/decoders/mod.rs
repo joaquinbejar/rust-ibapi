@@ -2,7 +2,7 @@ use prost::Message;
 
 use crate::contracts::OptionComputation;
 use crate::messages::ResponseMessage;
-use crate::proto::decoders::{optional_f64, optional_string_f64, parse_f64, ts};
+use crate::proto::decoders::{optional_f64, parse_f64, ts};
 use crate::server_versions;
 use crate::Error;
 
@@ -217,10 +217,23 @@ pub(crate) fn decode_tick_request_parameters_proto(bytes: &[u8]) -> Result<TickR
     })
 }
 
-/// A size's text exactly as IB sent it, when it is a set value: the same
-/// condition under which the `f64` beside it is reported.
-fn reported_text(opt: &Option<String>) -> Option<String> {
-    optional_string_f64(opt).and(opt.clone())
+/// A size field as IB sent it: `None` when the message carried none, an empty
+/// one, or IB's unset value; otherwise its text, exactly, with its `f64`.
+///
+/// The text is kept whether or not it parses: a size that is not a number is
+/// still evidence that IB sent one, and a consumer that reads sizes from the
+/// text must see it and refuse it, not find nothing. Its `f64` is then NaN,
+/// never a plausible number.
+fn reported_size(opt: &Option<String>) -> Option<(f64, String)> {
+    let text = opt.as_ref()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    match text.trim().parse::<f64>() {
+        Ok(value) if value == f64::MAX => None,
+        Ok(value) => Some((value, text.clone())),
+        Err(_) => Some((f64::NAN, text.clone())),
+    }
 }
 
 pub(crate) fn decode_tick_price_proto(bytes: &[u8]) -> Result<TickTypes, Error> {
@@ -229,8 +242,7 @@ pub(crate) fn decode_tick_price_proto(bytes: &[u8]) -> Result<TickTypes, Error> 
     let tick_type = TickType::from(msg.tick_type.unwrap_or_default());
     let price_present = msg.price.is_some();
     let price = msg.price.unwrap_or_default();
-    let size = optional_string_f64(&msg.size);
-    let size_text = reported_text(&msg.size);
+    let reported = reported_size(&msg.size);
     let attr_mask = msg.attr_mask.unwrap_or_default();
 
     let attributes = TickAttribute {
@@ -249,21 +261,21 @@ pub(crate) fn decode_tick_price_proto(bytes: &[u8]) -> Result<TickTypes, Error> 
         _ => TickType::Unknown,
     };
 
-    match (size_tick_type, size) {
+    match (size_tick_type, reported) {
         (TickType::Unknown, _) | (_, None) => Ok(TickTypes::Price(TickPrice {
             tick_type,
             price,
             price_present,
             attributes,
         })),
-        (size_tick_type, Some(size)) => Ok(TickTypes::PriceSize(TickPriceSize {
+        (size_tick_type, Some((size, size_text))) => Ok(TickTypes::PriceSize(TickPriceSize {
             price_tick_type: tick_type,
             price,
             price_present,
             attributes,
             size_tick_type,
             size,
-            size_text,
+            size_text: Some(size_text),
         })),
     }
 }
@@ -271,10 +283,13 @@ pub(crate) fn decode_tick_price_proto(bytes: &[u8]) -> Result<TickTypes, Error> 
 pub(crate) fn decode_tick_size_proto(bytes: &[u8]) -> Result<TickSize, Error> {
     let msg = crate::proto::TickSize::decode(bytes)?;
 
+    let reported = reported_size(&msg.size);
     Ok(TickSize {
         tick_type: TickType::from(msg.tick_type.unwrap_or_default()),
-        size: parse_f64(&msg.size),
-        size_text: reported_text(&msg.size),
+        // Absent or unset stays 0.0, as before; a size that is not a number
+        // is NaN rather than 0.0.
+        size: reported.as_ref().map_or_else(|| parse_f64(&msg.size), |(value, _)| *value),
+        size_text: reported.map(|(_, text)| text),
     })
 }
 

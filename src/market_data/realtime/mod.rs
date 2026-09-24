@@ -424,9 +424,10 @@ pub struct TickSize {
     pub tick_type: TickType,
     /// The size value.
     pub size: f64,
-    /// The size exactly as IB sent it, as decimal text, when it sent one that
-    /// is set. IB sends sizes as decimal text; `size` is that text parsed into
-    /// an `f64`, which can round it.
+    /// The size exactly as IB sent it, when it sent one that is set: kept
+    /// whether or not it is a number. IB sends sizes as decimal text; `size`
+    /// is that text parsed into an `f64`, which can round it, and is NaN when
+    /// the text is not a number.
     pub size_text: Option<String>,
 }
 
@@ -447,7 +448,8 @@ pub struct TickPriceSize {
     pub size_tick_type: TickType,
     /// The size value.
     pub size: f64,
-    /// The size exactly as IB sent it, as decimal text.
+    /// The size exactly as IB sent it, kept whether or not it is a number.
+    /// `size` is NaN when it is not.
     pub size_text: Option<String>,
 }
 

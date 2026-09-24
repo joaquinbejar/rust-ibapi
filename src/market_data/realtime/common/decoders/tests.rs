@@ -454,6 +454,46 @@ mod tick_presence_and_text_tests {
     }
 
     #[test]
+    fn a_size_that_is_not_a_number_is_kept_as_text_not_dropped() {
+        // The reviewer's case (ACS 1215, 1218): "not-a-size" became None, and a
+        // price tick carrying it fell back to a plain price, losing the fact
+        // that IB sent a size at all.
+        match decode_tick_price_proto(&price_tick(Some(1.5), Some("not-a-size"))).expect("decode failed") {
+            TickTypes::PriceSize(ps) => {
+                assert_eq!(ps.size_text.as_deref(), Some("not-a-size"));
+                assert!(ps.size.is_nan(), "never a plausible number");
+            }
+            other => panic!("expected PriceSize, got {other:?}"),
+        }
+        let size_tick = crate::proto::TickSize {
+            req_id: Some(9000),
+            tick_type: Some(0),
+            size: Some("not-a-size".to_owned()),
+        }
+        .encode_to_vec();
+        let decoded = decode_tick_size_proto(&size_tick).expect("decode failed");
+        assert_eq!(decoded.size_text.as_deref(), Some("not-a-size"));
+        assert!(decoded.size.is_nan());
+    }
+
+    #[test]
+    fn an_empty_size_is_no_size() {
+        match decode_tick_price_proto(&price_tick(Some(1.5), Some(""))).expect("decode failed") {
+            TickTypes::Price(tp) => assert!(tp.price_present),
+            other => panic!("expected Price, got {other:?}"),
+        }
+        let size_tick = crate::proto::TickSize {
+            req_id: Some(9000),
+            tick_type: Some(0),
+            size: Some(String::new()),
+        }
+        .encode_to_vec();
+        let decoded = decode_tick_size_proto(&size_tick).expect("decode failed");
+        assert_eq!(decoded.size_text, None);
+        assert_eq!(decoded.size, 0.0);
+    }
+
+    #[test]
     fn an_unset_size_has_no_text() {
         let unset = f64::MAX.to_string();
         match decode_tick_price_proto(&price_tick(Some(1.5), Some(&unset))).expect("decode failed") {
