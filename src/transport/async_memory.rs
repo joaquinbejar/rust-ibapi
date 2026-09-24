@@ -19,6 +19,8 @@ struct Inner {
     inbound: VecDeque<Vec<u8>>,
     outbound: Vec<u8>,
     closed: bool,
+    /// This side shut the stream down: writes are refused.
+    shut_down: bool,
     /// Remaining `reconnect()` calls that should fail before one succeeds.
     reconnect_failures: usize,
 }
@@ -93,7 +95,11 @@ impl AsyncIo for MemoryStream {
     }
 
     async fn write_all(&self, buf: &[u8]) -> Result<(), Error> {
-        self.inner.lock().unwrap().outbound.extend_from_slice(buf);
+        let mut inner = self.inner.lock().unwrap();
+        if inner.shut_down {
+            return Err(Error::Closed);
+        }
+        inner.outbound.extend_from_slice(buf);
         Ok(())
     }
 }
@@ -118,6 +124,15 @@ impl AsyncReconnect for MemoryStream {
         }
     }
     async fn sleep(&self, _duration: Duration) {}
+
+    fn shutdown(&self) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.shut_down = true;
+            inner.closed = true;
+        }
+        self.notify.notify_waiters();
+    }
 }
 
 impl AsyncStream for MemoryStream {}

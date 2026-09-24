@@ -95,7 +95,7 @@ impl Reconnect for MockSocket {
         Err(mock_socket_error(ErrorKind::ConnectionRefused))
     }
     fn sleep(&self, _duration: std::time::Duration) {}
-    fn shutdown_read(&self) -> Result<(), Error> {
+    fn shutdown(&self) -> Result<(), Error> {
         self.keep_alive.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -800,7 +800,7 @@ fn test_cleanup_thread_exits_promptly_on_shutdown() {
 }
 
 /// Dispatcher thread's blocked socket read is interrupted by
-/// `Reconnect::shutdown_read` from `request_shutdown`, instead of waiting
+/// `Reconnect::shutdown` from `request_shutdown`, instead of waiting
 /// up to the 1s `TWS_READ_TIMEOUT`. Companion to the cleanup-thread test;
 /// together they cover both threads `Client::drop` joins. Issue #523.
 #[test]

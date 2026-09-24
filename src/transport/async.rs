@@ -27,6 +27,10 @@ use super::routing::{
 };
 use super::RoutedItem;
 
+/// How long `ensure_shutdown` waits for the dispatcher task once the socket is
+/// closed. The close ends its read at once; this bounds anything else.
+const DISPATCHER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Default capacity for broadcast channels
 /// This should be large enough to handle bursts of messages without lagging
 pub(crate) const BROADCAST_CHANNEL_CAPACITY: usize = 1024;
@@ -254,6 +258,7 @@ impl<S: AsyncStream> Drop for AsyncTcpMessageBus<S> {
         // Set the shutdown flag and notify the message loop to exit
         self.shutdown_requested.store(true, Ordering::Relaxed);
         self.shutdown_notify.notify_waiters();
+        self.connection.shutdown();
     }
 }
 
@@ -354,6 +359,13 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
 
                         match result {
                             Ok(_) => continue,
+                            // A shutdown closes the socket, which fails this
+                            // read: that is the end, never a reason to
+                            // reconnect.
+                            Err(_) if message_bus.shutdown_requested.load(Ordering::Relaxed) => {
+                                debug!("dispatcher task exiting after shutdown");
+                                break;
+                            }
                             Err(ref err) if is_timeout_error(err) => {
                                 if message_bus.shutdown_requested.load(Ordering::Relaxed) {
                                     debug!("dispatcher task exiting");
@@ -466,13 +478,17 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         }
     }
 
-    /// Notify all waiting subscriptions about shutdown
+    /// Close the connection and notify all waiting subscriptions.
+    ///
+    /// The socket is closed for real first: from then on no message is sent,
+    /// and the peer sees the connection end, whatever else is in progress.
     async fn request_shutdown(&self) {
         debug!("shutdown requested");
 
         // Set the shutdown flag and mark as disconnected
         self.connected.store(false, Ordering::Relaxed);
         self.shutdown_requested.store(true, Ordering::Relaxed);
+        self.connection.shutdown();
         self.shutdown_notify.notify_waiters();
 
         // Clear all channels - dropping the senders will close the channels
@@ -833,12 +849,16 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
             task_guard.take()
         };
 
-        if let Some(handle) = task_handle {
+        if let Some(mut handle) = task_handle {
             debug!("Waiting for processing task to finish");
-            if let Err(e) = handle.await {
-                warn!("Error joining processing task: {e}");
+            match tokio::time::timeout(DISPATCHER_JOIN_TIMEOUT, &mut handle).await {
+                Ok(Ok(())) => debug!("Processing task finished"),
+                Ok(Err(e)) => warn!("Error joining processing task: {e}"),
+                Err(_) => {
+                    warn!("processing task still running {DISPATCHER_JOIN_TIMEOUT:?} after the socket closed; aborting it");
+                    handle.abort();
+                }
             }
-            debug!("Processing task finished");
         }
     }
 
@@ -846,6 +866,7 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
         debug!("sync shutdown requested");
         self.connected.store(false, Ordering::Relaxed);
         self.shutdown_requested.store(true, Ordering::Relaxed);
+        self.connection.shutdown();
         self.shutdown_notify.notify_waiters();
     }
 
@@ -867,3 +888,7 @@ pub(crate) mod test_listener;
 #[cfg(test)]
 #[path = "async_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "async_close_tests.rs"]
+mod close_tests;

@@ -87,6 +87,15 @@ pub enum Error {
     #[error("Shutdown")]
     Shutdown,
 
+    /// The connection was closed, and this message was refused **before any
+    /// byte of it was handed to the socket**: it was not sent.
+    ///
+    /// This is the only send error that proves nothing went out. Any other
+    /// error from a write (an [`Error::Io`] above all) may have come after
+    /// some bytes, or a whole message, reached the kernel, and is ambiguous.
+    #[error("Closed: the connection is closed and the message was not sent")]
+    Closed,
+
     /// Reached end of data stream.
     #[error("EndOfStream")]
     EndOfStream,
@@ -210,6 +219,7 @@ impl Clone for Error {
             Error::ConnectionReset => Error::ConnectionReset,
             Error::Cancelled => Error::Cancelled,
             Error::Shutdown => Error::Shutdown,
+            Error::Closed => Error::Closed,
             Error::EndOfStream => Error::EndOfStream,
             Error::UnexpectedResponse(m) => Error::UnexpectedResponse(m.clone()),
             Error::UnexpectedEndOfStream => Error::UnexpectedEndOfStream,

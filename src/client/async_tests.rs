@@ -188,3 +188,25 @@ async fn builder_connect_with_notice_stream_captures_handshake_notice() {
         .expect("notice stream closed");
     assert_eq!(n.code, 2104);
 }
+
+// A real close: `disconnect` ends the connection for the peer, and nothing
+// is sent after it, a subscription's cancel included.
+#[tokio::test]
+async fn disconnect_closes_the_socket_and_nothing_is_sent_after_it() {
+    let (addr, listener) = spawn_handshake_listener(handshake_frames()).await;
+    let client = Client::connect(&addr.to_string(), 100).await.expect("Client::connect");
+    let contract = Contract::stock("AAPL").build();
+    let subscription = client.market_data(&contract).subscribe().await.expect("subscribes");
+
+    client.disconnect().await;
+
+    // The listener drains until the peer's connection ends: it returns once
+    // the socket is really closed, while `client` is still alive.
+    tokio::time::timeout(std::time::Duration::from_secs(2), listener)
+        .await
+        .expect("the peer sees the connection end")
+        .expect("the listener joins");
+    let cancel = subscription.try_cancel().await;
+    assert!(matches!(cancel, Err(Error::Closed)), "{cancel:?}");
+    drop(client);
+}

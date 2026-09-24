@@ -179,10 +179,9 @@ impl<S: Stream> Connection<S> {
         Ok(message)
     }
 
-    /// Break any in-flight blocking read on the underlying socket so the
-    /// dispatcher exits promptly on shutdown.
-    pub(crate) fn shutdown_read(&self) -> Result<(), Error> {
-        self.socket.shutdown_read()
+    /// Close the socket for real and for good: see `Reconnect::shutdown`.
+    pub(crate) fn shutdown(&self) -> Result<(), Error> {
+        self.socket.shutdown()
     }
 
     /// Write raw bytes with a length prefix

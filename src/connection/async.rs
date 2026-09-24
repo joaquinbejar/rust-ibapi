@@ -190,7 +190,15 @@ impl<S: AsyncStream> AsyncConnection<S> {
         Ok(message)
     }
 
-    /// Write raw bytes with a length prefix
+    /// Close the socket for real and for good: see `AsyncReconnect::shutdown`.
+    pub(crate) fn shutdown(&self) {
+        self.socket.shutdown();
+    }
+
+    /// Write raw bytes with a length prefix.
+    ///
+    /// [`Error::Closed`] means nothing was sent. Any other error may come
+    /// after some bytes reached the socket, and is ambiguous.
     pub(crate) async fn write_raw(&self, data: &[u8]) -> Result<(), Error> {
         let packet = encode_raw_length(data);
         self.socket.write_all(&packet).await?;
