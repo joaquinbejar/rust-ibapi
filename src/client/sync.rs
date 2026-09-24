@@ -13,7 +13,7 @@ use time_tz::Tz;
 
 use crate::client::builders::client_builder::sync_impl::ClientBuilder;
 use crate::connection::common::StartupMessage;
-use crate::connection::{sync::Connection, ConnectionMetadata};
+use crate::connection::{split_accounts, sync::Connection, ConnectionMetadata};
 use crate::contracts::Contract;
 use crate::errors::Error;
 use crate::market_data::builder::MarketDataBuilder;
@@ -38,6 +38,8 @@ pub struct Client {
 
     client_id: i32,              // ID of client.
     id_manager: ClientIdManager, // Manages request and order ID generation
+    /// The accounts the Gateway listed during the handshake, in its order.
+    handshake_managed_accounts: Vec<String>,
 }
 
 impl Client {
@@ -119,9 +121,19 @@ impl Client {
             message_bus,
             client_id: connection_metadata.client_id,
             id_manager: ClientIdManager::new(connection_metadata.next_order_id),
+            handshake_managed_accounts: split_accounts(&connection_metadata.managed_accounts),
         };
 
         Ok(client)
+    }
+
+    /// The accounts the Gateway listed in its handshake, in the order it
+    /// listed them: what this session was accepted for.
+    ///
+    /// Taken once, from the handshake's own `managedAccounts` message, and not
+    /// refreshed. For the current list, ask the Gateway.
+    pub fn handshake_managed_accounts(&self) -> &[String] {
+        &self.handshake_managed_accounts
     }
 
     /// Returns the ID assigned to the [Client].
@@ -362,6 +374,7 @@ impl Client {
             message_bus,
             client_id: 100,
             id_manager: ClientIdManager::new(-1),
+            handshake_managed_accounts: Vec::new(),
         }
     }
 

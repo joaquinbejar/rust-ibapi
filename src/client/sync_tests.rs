@@ -208,3 +208,15 @@ fn disconnect_closes_the_socket_and_nothing_is_sent_after_it() {
     assert!(matches!(cancel, Err(Error::Closed)), "{cancel:?}");
     drop(client);
 }
+
+// The accounts the handshake listed are kept, in order, without a second
+// request.
+#[test]
+fn the_handshakes_managed_accounts_are_kept() {
+    let mut frames = handshake_frames();
+    let accounts = frames.last_mut().expect("the managed accounts frame");
+    *accounts = binary_text(IncomingMessages::ManagedAccounts as i32, "1\0DU1111111, DU2222222,\0");
+    let (addr, _h) = spawn_handshake_listener(frames);
+    let client = Client::connect(&addr.to_string(), 100).expect("Client::connect");
+    assert_eq!(client.handshake_managed_accounts(), ["DU1111111", "DU2222222"]);
+}

@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 
 use crate::client::builders::client_builder::async_impl::ClientBuilder;
 use crate::connection::common::StartupMessage;
-use crate::connection::{r#async::AsyncConnection, ConnectionMetadata};
+use crate::connection::{r#async::AsyncConnection, split_accounts, ConnectionMetadata};
 use crate::messages::{Notice, OutgoingMessages};
 use crate::transport::{
     r#async::{AsyncInternalSubscription, AsyncTcpMessageBus},
@@ -32,6 +32,8 @@ pub struct Client {
 
     client_id: i32,                   // ID of client.
     id_manager: Arc<ClientIdManager>, // Manages request and order ID generation
+    /// The accounts the Gateway listed during the handshake, in its order.
+    handshake_managed_accounts: Vec<String>,
 }
 
 impl Drop for Client {
@@ -132,9 +134,19 @@ impl Client {
             message_bus,
             client_id: connection_metadata.client_id,
             id_manager: Arc::new(ClientIdManager::new(connection_metadata.next_order_id)),
+            handshake_managed_accounts: split_accounts(&connection_metadata.managed_accounts),
         };
 
         Ok(client)
+    }
+
+    /// The accounts the Gateway listed in its handshake, in the order it
+    /// listed them: what this session was accepted for.
+    ///
+    /// Taken once, from the handshake's own `managedAccounts` message, and not
+    /// refreshed. For the current list, ask the Gateway.
+    pub fn handshake_managed_accounts(&self) -> &[String] {
+        &self.handshake_managed_accounts
     }
 
     /// Returns the server version
