@@ -60,6 +60,29 @@ pub(crate) fn optional_text_f64(text: &str, field: &str) -> Result<Option<f64>, 
     required_text_f64(text, field).map(Some)
 }
 
+/// A numeric string field that IB may leave out.
+///
+/// Three cases, kept apart: an absent field (or IB's unset maximum) is
+/// `None`, a stated number is that number, zero included, and anything that
+/// is not a finite number is an error naming the field. `parse_f64` answers
+/// `0.0` for all three, which reads an order IB said nothing about as one
+/// that filled nothing.
+pub(crate) fn optional_decimal_f64(opt: &Option<String>, field: &str) -> Result<Option<f64>, Error> {
+    let Some(text) = opt.as_deref() else {
+        return Ok(None);
+    };
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let value = text
+        .parse::<f64>()
+        .map_err(|_| Error::Parse(0, text.to_string(), format!("{field} is not a number")))?;
+    if !value.is_finite() {
+        return Err(Error::Parse(0, text.to_string(), format!("{field} is not a finite number")));
+    }
+    Ok((value != f64::MAX).then_some(value))
+}
+
 pub(crate) fn parse_i32(opt: &Option<String>) -> i32 {
     opt.as_deref().and_then(|s| s.parse::<i32>().ok()).unwrap_or_default()
 }
@@ -343,7 +366,7 @@ pub fn decode_order(proto: &proto::Order) -> Result<Order, Error> {
     order.is_oms_container = proto.is_oms_container.unwrap_or_default();
     order.discretionary_up_to_limit_price = proto.discretionary_up_to_limit_price.unwrap_or_default();
     order.auto_cancel_date = s(&proto.auto_cancel_date);
-    order.filled_quantity = parse_f64(&proto.filled_quantity);
+    order.filled_quantity = optional_decimal_f64(&proto.filled_quantity, "filled_quantity")?;
     order.ref_futures_con_id = proto.ref_futures_con_id.map(Some).unwrap_or(Some(0));
     order.auto_cancel_parent = proto.auto_cancel_parent.unwrap_or_default();
     order.shareholder = s(&proto.shareholder);

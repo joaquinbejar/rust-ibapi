@@ -329,8 +329,8 @@ async fn test_async_order_update_stream() {
         OrderUpdate::OrderStatus(OrderStatus {
             order_id: 100,
             status: OrderStatusKind::PendingSubmit,
-            filled: 0.0,
-            remaining: 100.0,
+            filled: Some(0.0),
+            remaining: Some(100.0),
             average_fill_price: None,
             perm_id: 12345,
             parent_id: 0,
@@ -342,8 +342,8 @@ async fn test_async_order_update_stream() {
         OrderUpdate::OrderStatus(OrderStatus {
             order_id: 100,
             status: OrderStatusKind::Submitted,
-            filled: 0.0,
-            remaining: 100.0,
+            filled: Some(0.0),
+            remaining: Some(100.0),
             average_fill_price: None,
             perm_id: 12345,
             parent_id: 0,
@@ -355,8 +355,8 @@ async fn test_async_order_update_stream() {
         OrderUpdate::OrderStatus(OrderStatus {
             order_id: 100,
             status: OrderStatusKind::Filled,
-            filled: 100.0,
-            remaining: 0.0,
+            filled: Some(100.0),
+            remaining: Some(0.0),
             average_fill_price: Some(50.00),
             perm_id: 12345,
             parent_id: 0,
@@ -392,7 +392,7 @@ async fn test_async_order_update_stream() {
 
     if let OrderUpdate::OrderStatus(status) = &updates[2] {
         assert_eq!(status.status, OrderStatusKind::Filled);
-        assert_eq!(status.filled, 100.0);
+        assert_eq!(status.filled, Some(100.0));
         assert_eq!(status.average_fill_price, Some(50.00));
     }
 }

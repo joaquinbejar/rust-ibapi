@@ -34,11 +34,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
             match update {
                 Ok(OrderUpdate::OrderStatus(status)) => {
                     println!(
-                        "[Monitor] order {} status: {} filled {}/{}",
+                        "[Monitor] order {} status: {} filled {:?}/{:?}",
                         status.order_id,
                         status.status,
                         status.filled,
-                        status.filled + status.remaining
+                        status.filled.zip(status.remaining).map(|(filled, remaining)| filled + remaining)
                     );
                 }
                 Ok(OrderUpdate::OpenOrder(o)) => {
