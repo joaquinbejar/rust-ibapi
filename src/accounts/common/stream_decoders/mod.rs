@@ -30,9 +30,9 @@ impl StreamDecoder<AccountSummaryResult> for AccountSummaryResult {
         }
     }
 
-    fn cancel_message(_server_version: i32, request_id: Option<i32>, _context: Option<&DecoderContext>) -> Result<Vec<u8>, Error> {
+    fn cancel_message(server_version: i32, request_id: Option<i32>, _context: Option<&DecoderContext>) -> Result<Vec<u8>, Error> {
         let request_id = error_helpers::require_request_id(request_id)?;
-        encoders::encode_cancel_account_summary(request_id)
+        encoders::encode_cancel_account_summary(server_version, request_id)
     }
 }
 

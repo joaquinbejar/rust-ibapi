@@ -34,6 +34,53 @@ pub struct AccountSummary {
     pub currency: String,
 }
 
+/// How a cancel of an account summary subscription is written for a server
+/// version.
+///
+/// The protobuf cancel (message 63 plus 200) is the default wherever
+/// protobuf is. One server version is known to need the older encoding: on
+/// IB Gateway 10.45.1j, server version 221, a protobuf cancel is accepted
+/// without freeing the subscription's slot, so the third request on one
+/// connection is refused with 322, while the legacy cancel (message 63 as a
+/// binary id, then version 1 and the request id as text fields) frees it and
+/// four requests in a row end normally on the same connection (ib-engine's
+/// wire probe without this SDK, 2026-09-25). That is evidence about that one
+/// Gateway and version, not about IB in general: every other version keeps
+/// the protobuf cancel until it is shown otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountSummaryCancelCodec {
+    /// The protobuf `CancelAccountSummary`, message id 263 on the wire.
+    Protobuf,
+    /// The legacy text fields `1`, request id, after the binary message id 63.
+    Legacy,
+}
+
+/// The server versions whose Gateway is known to need the legacy cancel of an
+/// account summary; see [`AccountSummaryCancelCodec`].
+pub const LEGACY_ACCOUNT_SUMMARY_CANCEL_SERVER_VERSIONS: &[i32] = &[221];
+
+impl AccountSummaryCancelCodec {
+    /// The codec this client uses for `server_version`.
+    #[must_use]
+    pub fn for_server_version(server_version: i32) -> Self {
+        if LEGACY_ACCOUNT_SUMMARY_CANCEL_SERVER_VERSIONS.contains(&server_version) {
+            Self::Legacy
+        } else {
+            Self::Protobuf
+        }
+    }
+
+    /// The message id as it goes on the wire: 263 for the protobuf cancel,
+    /// 63 for the legacy one.
+    #[must_use]
+    pub const fn wire_message_id(self) -> i32 {
+        match self {
+            Self::Protobuf => crate::messages::OutgoingMessages::CancelAccountSummary as i32 + crate::messages::PROTOBUF_MSG_ID,
+            Self::Legacy => crate::messages::OutgoingMessages::CancelAccountSummary as i32,
+        }
+    }
+}
+
 /// Constants for account summary tags used in account summary requests.
 /// These tags define which account information fields to retrieve.
 pub struct AccountSummaryTags {}

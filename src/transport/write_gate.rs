@@ -103,8 +103,10 @@ pub trait WriteCall: Send {
 
 /// Describe a message body (without its length prefix) for a gate.
 ///
-/// A protobuf message starts with its id plus 200, big-endian; a text message
-/// with its id in digits before the first NUL. The order id of a placement or
+/// A protobuf message starts with its id plus 200, big-endian; a legacy
+/// message for a server that reads binary ids with its id alone, big-endian
+/// (the account summary cancel on server 221); a text message with its id in
+/// digits before the first NUL. The order id of a placement or
 /// an order cancel is read from the protobuf request itself.
 pub(crate) fn describe(body: &[u8], request_id: Option<i32>, handshake: bool) -> OutgoingMeta {
     let message = message_of(body);
@@ -144,8 +146,19 @@ fn proto_body(body: &[u8]) -> Option<&[u8]> {
     body.get(4..)
 }
 
+/// The id of a legacy message written with a binary id: a big-endian prefix
+/// whose first byte is zero, at most 200.
+fn binary_legacy_id(body: &[u8]) -> Option<i32> {
+    let prefix: [u8; 4] = body.get(..4)?.try_into().ok()?;
+    if prefix[0] != 0 {
+        return None;
+    }
+    let raw = i32::from_be_bytes(prefix);
+    (raw > 0 && raw <= PROTOBUF_MSG_ID).then_some(raw)
+}
+
 fn message_of(body: &[u8]) -> Option<OutgoingMessages> {
-    let id = match proto_id(body) {
+    let id = match proto_id(body).or_else(|| binary_legacy_id(body)) {
         Some(id) => id,
         None => {
             let text = body.split(|byte| *byte == 0).next()?;

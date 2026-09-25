@@ -393,6 +393,12 @@ fn the_gate_is_told_the_message_and_its_order_id() {
     let md = describe(b"1\x0011\x00", Some(3), false);
     assert_eq!(md.message, Some(OutgoingMessages::RequestMarketData));
 
+    // A legacy message with a binary id: the account summary cancel on
+    // server 221.
+    let legacy = describe(b"\x00\x00\x00\x3f1\x0060002\x00", Some(60002), false);
+    assert_eq!(legacy.message, Some(OutgoingMessages::CancelAccountSummary));
+    assert_eq!(legacy.request_id, Some(60002));
+
     // The handshake, and a frame with no recognisable id.
     let handshake = describe(&[], None, true);
     assert!(handshake.handshake);
