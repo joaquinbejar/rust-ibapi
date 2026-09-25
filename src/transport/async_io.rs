@@ -143,6 +143,7 @@ impl AsyncIo for AsyncTcpSocket {
         // the drop of this future included. Its deadline is asked once.
         let mut call = gate.begin(meta);
         let deadline = call.deadline();
+        let wake = call.wakeup();
         // What the write was last waiting for, so a deadline that passes is
         // named by the wait it ended, across every release and retake.
         let mut waiting = Waiting::Start;
@@ -202,9 +203,16 @@ impl AsyncIo for AsyncTcpSocket {
                         return Err(Error::Refused(Refusal::Expired { waiting_for: waiting }));
                     }
                     let until = retry_at.min(at);
+                    let woken = async {
+                        match &wake {
+                            Some(wake) => wake.notified().await,
+                            None => std::future::pending().await,
+                        }
+                    };
                     tokio::select! {
                         () = tokio::time::sleep_until(until.into()) => {}
                         () = &mut closing => {}
+                        () = woken => {}
                     }
                 }
             }

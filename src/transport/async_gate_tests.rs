@@ -623,3 +623,171 @@ async fn an_expired_write_names_the_wait_it_ended_after_a_writer_wait() {
     );
     socket.shutdown();
 }
+
+/// A gate whose calls answer `Later` (retry far away) until `open` is set,
+/// and hand the fork a wake the test controls.
+struct Woken {
+    open: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+    admits: Arc<AtomicUsize>,
+    with_wake: bool,
+    deadline_ms: u64,
+    // Notify from inside `admit`, before the write waits: the permit must
+    // be kept.
+    notify_in_admit: bool,
+}
+
+struct WokenCall {
+    open: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+    admits: Arc<AtomicUsize>,
+    with_wake: bool,
+    deadline: Deadline,
+    notify_in_admit: bool,
+}
+
+impl WriteGate for Woken {
+    fn begin(&self, _meta: &OutgoingMeta) -> Box<dyn WriteCall> {
+        Box::new(WokenCall {
+            open: Arc::clone(&self.open),
+            notify: Arc::clone(&self.notify),
+            admits: Arc::clone(&self.admits),
+            with_wake: self.with_wake,
+            deadline: in_ms(self.deadline_ms),
+            notify_in_admit: self.notify_in_admit,
+        })
+    }
+}
+
+impl WriteCall for WokenCall {
+    fn deadline(&self) -> Deadline {
+        self.deadline
+    }
+    fn admit(&mut self) -> Admit {
+        let n = self.admits.fetch_add(1, Ordering::SeqCst);
+        if self.open.load(Ordering::SeqCst) {
+            return Admit::Write;
+        }
+        if self.notify_in_admit && n == 0 {
+            // The turn is granted while the write still holds the lock and
+            // has not begun to wait.
+            self.open.store(true, Ordering::SeqCst);
+            self.notify.notify_one();
+        }
+        Admit::Later {
+            retry_at: Instant::now() + Duration::from_secs(60),
+        }
+    }
+    fn wakeup(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.with_wake.then(|| Arc::clone(&self.notify))
+    }
+}
+
+fn woken(with_wake: bool, deadline_ms: u64, notify_in_admit: bool) -> (Arc<Woken>, Arc<AtomicBool>, Arc<tokio::sync::Notify>, Arc<AtomicUsize>) {
+    let open = Arc::new(AtomicBool::new(false));
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let admits = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(Woken {
+        open: Arc::clone(&open),
+        notify: Arc::clone(&notify),
+        admits: Arc::clone(&admits),
+        with_wake,
+        deadline_ms,
+        notify_in_admit,
+    });
+    (gate, open, notify, admits)
+}
+
+#[tokio::test]
+async fn a_wake_ends_the_wait_before_retry_at() {
+    let (gate, open, notify, admits) = woken(true, 10_000, false);
+    let (socket, _peer) = pair(gate).await;
+    let started = Instant::now();
+    let writing = tokio::spawn({
+        let socket = Arc::clone(&socket);
+        async move { write(&socket, b"49\x001\x00").await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    open.store(true, Ordering::SeqCst);
+    notify.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), writing)
+        .await
+        .expect("woken, not left until retry_at")
+        .expect("task did not panic")
+        .expect("written");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(admits.load(Ordering::SeqCst), 2, "one Later, then the woken admit");
+    socket.shutdown();
+}
+
+#[tokio::test]
+async fn a_wake_given_before_the_wait_is_not_lost() {
+    // The gate grants the turn from inside `admit`: the write has not begun
+    // to wait yet. `notify_one` keeps the permit, so the wait ends at once.
+    let (gate, _open, _notify, admits) = woken(true, 10_000, true);
+    let (socket, _peer) = pair(gate).await;
+    tokio::time::timeout(Duration::from_secs(2), write(&socket, b"49\x001\x00"))
+        .await
+        .expect("the kept permit ends the wait")
+        .expect("written");
+    assert_eq!(admits.load(Ordering::SeqCst), 2);
+    socket.shutdown();
+}
+
+#[tokio::test]
+async fn without_a_wake_the_write_waits_for_time_alone() {
+    // The control: the same gate with no wake, notified all the same. The
+    // write is not woken, and ends at its deadline.
+    let (gate, open, notify, _admits) = woken(false, 400, false);
+    let (socket, _peer) = pair(gate).await;
+    let started = Instant::now();
+    let writing = tokio::spawn({
+        let socket = Arc::clone(&socket);
+        async move { write(&socket, b"49\x001\x00").await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    open.store(true, Ordering::SeqCst);
+    notify.notify_one();
+    let outcome = tokio::time::timeout(Duration::from_secs(3), writing)
+        .await
+        .expect("bounded by its deadline")
+        .expect("task did not panic");
+    assert!(
+        matches!(outcome, Err(Error::Refused(Refusal::Expired { waiting_for: Waiting::Slot }))),
+        "{outcome:?}"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(390));
+    socket.shutdown();
+}
+
+#[tokio::test]
+async fn wakes_never_move_the_deadline() {
+    // Woken over and over, and never admitted: refused at the deadline fixed
+    // when the write began, not later.
+    let (gate, _open, notify, admits) = woken(true, 400, false);
+    let (socket, _peer) = pair(gate).await;
+    let started = Instant::now();
+    let writing = tokio::spawn({
+        let socket = Arc::clone(&socket);
+        async move { write(&socket, b"49\x001\x00").await }
+    });
+    let waking = tokio::spawn(async move {
+        for _ in 0..40 {
+            notify.notify_one();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let outcome = tokio::time::timeout(Duration::from_secs(3), writing)
+        .await
+        .expect("bounded by its deadline")
+        .expect("task did not panic");
+    let took = started.elapsed();
+    waking.await.expect("waker did not panic");
+    assert!(
+        matches!(outcome, Err(Error::Refused(Refusal::Expired { waiting_for: Waiting::Slot }))),
+        "{outcome:?}"
+    );
+    assert!(took < Duration::from_millis(700), "the deadline was extended: {took:?}");
+    assert!(admits.load(Ordering::SeqCst) > 2, "the wakes woke it");
+    socket.shutdown();
+}

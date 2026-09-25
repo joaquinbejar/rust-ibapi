@@ -99,6 +99,16 @@ pub trait WriteCall: Send {
     /// Whether the write may go out now. Called with the writer's lock held
     /// and before any byte: it must not block.
     fn admit(&mut self) -> Admit;
+
+    /// A notification that wakes the write while it waits after `Later`,
+    /// besides its `retry_at`, its deadline and the connection's close. Asked
+    /// once, when the write begins. A gate that grants turns notifies with
+    /// `notify_one`, whose permit is kept if the write is not waiting yet, so
+    /// a wake between `Later` and the wait is never lost. A wake never moves
+    /// the deadline. None, the default, is a write woken by time alone.
+    fn wakeup(&self) -> Option<std::sync::Arc<tokio::sync::Notify>> {
+        None
+    }
 }
 
 /// Describe a message body (without its length prefix) for a gate.
