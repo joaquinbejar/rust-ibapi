@@ -380,7 +380,7 @@ impl Client {
     /// for update in updates.iter_data() {
     ///     match update? {
     ///         OrderUpdate::OrderStatus(status) => {
-    ///             println!("Order {} status: {} - filled: {}/{}",
+    ///             println!("Order {} status: {} - filled: {:?}/{:?}",
     ///                 status.order_id, status.status, status.filled, status.remaining);
     ///         },
     ///         OrderUpdate::OpenOrder(order_data) => {

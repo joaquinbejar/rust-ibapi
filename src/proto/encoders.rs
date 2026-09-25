@@ -276,11 +276,7 @@ pub fn encode_order(order: &Order) -> proto::Order {
         // fields not directly mapped from our Order struct
         order_id: None,
         auto_cancel_date: some_str(&order.auto_cancel_date),
-        filled_quantity: if order.filled_quantity == 0.0 {
-            None
-        } else {
-            Some(order.filled_quantity.to_string())
-        },
+        filled_quantity: order.filled_quantity.map(|quantity| quantity.to_string()),
         ref_futures_con_id: order.ref_futures_con_id,
         shareholder: some_str(&order.shareholder),
         route_marketable_to_bbo: if order.route_marketable_to_bbo { Some(1) } else { None },

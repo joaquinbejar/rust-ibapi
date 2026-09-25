@@ -78,8 +78,8 @@ fn place_order() {
     if let Some(Ok(PlaceOrder::OrderStatus(order_status))) = notifications.next_data() {
         assert_eq!(order_status.order_id, 13, "order_status.order_id");
         assert_eq!(order_status.status, OrderStatusKind::PreSubmitted, "order_status.status");
-        assert_eq!(order_status.filled, 0.0, "order_status.filled");
-        assert_eq!(order_status.remaining, 100.0, "order_status.remaining");
+        assert_eq!(order_status.filled, Some(0.0), "order_status.filled");
+        assert_eq!(order_status.remaining, Some(100.0), "order_status.remaining");
         assert_eq!(order_status.average_fill_price, Some(0.0), "order_status.average_fill_price");
         assert_eq!(order_status.perm_id, 1376327563, "order_status.perm_id");
         assert_eq!(order_status.parent_id, 0, "order_status.parent_id");
@@ -107,8 +107,8 @@ fn place_order() {
 
     if let Some(Ok(PlaceOrder::OrderStatus(order_status))) = notifications.next_data() {
         assert_eq!(order_status.status, OrderStatusKind::Filled, "order_status.status");
-        assert_eq!(order_status.filled, 100.0, "order_status.filled");
-        assert_eq!(order_status.remaining, 0.0, "order_status.remaining");
+        assert_eq!(order_status.filled, Some(100.0), "order_status.filled");
+        assert_eq!(order_status.remaining, Some(0.0), "order_status.remaining");
     } else {
         assert!(false, "message[4] expected order status notification");
     }
@@ -154,8 +154,8 @@ fn cancel_order() {
     if let Some(Ok(CancelOrder::OrderStatus(order_status))) = results.next_data() {
         assert_eq!(order_status.order_id, 41, "order_status.order_id");
         assert_eq!(order_status.status, OrderStatusKind::Cancelled, "order_status.status");
-        assert_eq!(order_status.filled, 0.0, "order_status.filled");
-        assert_eq!(order_status.remaining, 100.0, "order_status.remaining");
+        assert_eq!(order_status.filled, Some(0.0), "order_status.filled");
+        assert_eq!(order_status.remaining, Some(100.0), "order_status.remaining");
         assert_eq!(order_status.average_fill_price, Some(0.0), "order_status.average_fill_price");
         assert_eq!(order_status.perm_id, 71270927, "order_status.perm_id");
         assert_eq!(order_status.parent_id, 0, "order_status.parent_id");
@@ -525,8 +525,8 @@ fn order_update_stream() {
     if let Some(Ok(OrderUpdate::OrderStatus(status))) = notifications.next_data() {
         assert_eq!(status.order_id, 13, "order_status.order_id");
         assert_eq!(status.status, OrderStatusKind::PreSubmitted, "order_status.status");
-        assert_eq!(status.filled, 0.0, "order_status.filled");
-        assert_eq!(status.remaining, 100.0, "order_status.remaining");
+        assert_eq!(status.filled, Some(0.0), "order_status.filled");
+        assert_eq!(status.remaining, Some(100.0), "order_status.remaining");
     } else {
         assert!(false, "expected order status notification");
     }

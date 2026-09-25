@@ -387,8 +387,10 @@ pub struct Order {
     pub dont_use_auto_price_for_hedge: bool,
     /// Specifies the date to auto cancel the order.
     pub auto_cancel_date: String, // TODO date object
-    /// Specifies the initial order quantity to be filled.
-    pub filled_quantity: f64,
+    /// The quantity IB reports as filled for the order. `None` when IB did not
+    /// state it; a stated zero is `Some(0.0)`. A value that is not a number
+    /// fails the decode rather than reading as zero.
+    pub filled_quantity: Option<f64>,
     /// Identifies the reference future conId.
     pub ref_futures_con_id: Option<i32>,
     /// Cancels the parent order if child order was cancelled.
@@ -577,7 +579,7 @@ impl Default for Order {
             mifid2_execution_algo: "".to_owned(),
             dont_use_auto_price_for_hedge: false,
             auto_cancel_date: "".to_owned(),
-            filled_quantity: 0.0,
+            filled_quantity: None,
             ref_futures_con_id: Some(0),
             auto_cancel_parent: false,
             shareholder: "".to_owned(),
@@ -1577,10 +1579,12 @@ pub struct OrderStatus {
     /// The current status of the order. See [`OrderStatusKind`] for variant
     /// definitions and helpers like [`is_terminal`](OrderStatusKind::is_terminal).
     pub status: OrderStatusKind,
-    /// Number of filled positions.
-    pub filled: f64,
-    /// The remnant positions.
-    pub remaining: f64,
+    /// Number of filled positions. `None` when IB did not state it; a stated
+    /// zero is `Some(0.0)`. A value that is not a number fails the decode
+    /// rather than reading as zero.
+    pub filled: Option<f64>,
+    /// The remnant positions, with the same three cases as `filled`.
+    pub remaining: Option<f64>,
     /// Average filling price. `None` when IBKR did not send a value (UNSET_DOUBLE on text protocol; missing optional field on protobuf).
     pub average_fill_price: Option<f64>,
     /// The order's permId used by the TWS to identify orders.
