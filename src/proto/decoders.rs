@@ -166,7 +166,7 @@ pub fn decode_contract(proto: &proto::Contract) -> Result<Contract, Error> {
         combo_legs_description: s(&proto.combo_legs_descrip),
         combo_legs: proto.combo_legs.iter().map(decode_combo_leg).collect::<Result<Vec<_>, _>>()?,
         delta_neutral_contract: proto.delta_neutral_contract.as_ref().map(decode_delta_neutral_contract),
-        last_trade_date: None,
+        last_trade_date: proto.last_trade_date.clone().filter(|s| !s.is_empty()),
     })
 }
 

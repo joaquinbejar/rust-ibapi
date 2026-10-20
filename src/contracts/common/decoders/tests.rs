@@ -135,6 +135,47 @@ fn test_decode_contract_data_proto() {
     assert_eq!(result.subcategory, "Consumer Electronics");
 }
 
+/// Contract data with tag 4 (`last_trade_date_or_contract_month`) and, when given, tag 21 (`last_trade_date`).
+fn contract_data_bytes(last_trade_date: Option<&str>) -> Vec<u8> {
+    let proto_msg = crate::proto::ContractData {
+        req_id: Some(1),
+        contract: Some(crate::proto::Contract {
+            con_id: Some(1),
+            symbol: Some("SPX".into()),
+            sec_type: Some("OPT".into()),
+            last_trade_date_or_contract_month: Some("20261016".into()),
+            last_trade_date: last_trade_date.map(String::from),
+            ..Default::default()
+        }),
+        contract_details: Some(crate::proto::ContractDetails::default()),
+    };
+    proto_msg.encode_to_vec()
+}
+
+#[test]
+fn test_decode_contract_data_proto_keeps_last_trade_date_verbatim() {
+    let result = decode_contract_data_proto(&contract_data_bytes(Some("20261016 16:00:00 US/Eastern"))).unwrap();
+
+    assert_eq!(result.contract.last_trade_date_or_contract_month, "20261016");
+    assert_eq!(result.contract.last_trade_date.as_deref(), Some("20261016 16:00:00 US/Eastern"));
+    assert_eq!(result.last_trade_time, "", "tag 21 does not fill ContractDetails.last_trade_time");
+}
+
+#[test]
+fn test_decode_contract_data_proto_absent_last_trade_date_is_none() {
+    let result = decode_contract_data_proto(&contract_data_bytes(None)).unwrap();
+
+    assert_eq!(result.contract.last_trade_date_or_contract_month, "20261016");
+    assert_eq!(result.contract.last_trade_date, None);
+}
+
+#[test]
+fn test_decode_contract_data_proto_empty_last_trade_date_is_none() {
+    let result = decode_contract_data_proto(&contract_data_bytes(Some(""))).unwrap();
+
+    assert_eq!(result.contract.last_trade_date, None);
+}
+
 #[test]
 fn test_decode_symbol_samples_proto() {
     let proto_msg = crate::proto::SymbolSamples {

@@ -96,7 +96,7 @@ pub struct ContractBuilder {
     pub(crate) combo_legs_description: Option<String>,
     pub(crate) combo_legs: Option<Vec<ComboLeg>>,
     pub(crate) delta_neutral_contract: Option<DeltaNeutralContract>,
-    pub(crate) last_trade_date: Option<time::Date>,
+    pub(crate) last_trade_date: Option<String>,
     pub(crate) issuer_id: Option<String>,
     pub(crate) description: Option<String>,
 }
@@ -294,12 +294,12 @@ impl ContractBuilder {
         self
     }
 
-    /// Sets the last trade date.
+    /// Sets the last trade date, as text in IB's format (e.g. `"20261016 16:00:00 US/Eastern"`).
     ///
     /// Server responses overwrite this on contract-details round-trips,
     /// so most callers can leave it unset.
-    pub fn last_trade_date(mut self, date: time::Date) -> Self {
-        self.last_trade_date = Some(date);
+    pub fn last_trade_date<S: Into<String>>(mut self, last_trade_date: S) -> Self {
+        self.last_trade_date = Some(last_trade_date.into());
         self
     }
 

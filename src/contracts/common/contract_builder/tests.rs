@@ -376,8 +376,6 @@ fn test_contract_builder_defaults() {
 /// See `plans/v3-api-ergonomics.md` §1 for the rationale.
 #[test]
 fn setter_parity_with_contract_fields() {
-    let date = time::macros::date!(2024 - 12 - 20);
-
     let built = ContractBuilder::new()
         .contract_id(99)
         .symbol("X")
@@ -407,7 +405,7 @@ fn setter_parity_with_contract_fields() {
             delta: 0.5,
             price: 100.0,
         })
-        .last_trade_date(date)
+        .last_trade_date("20241220 16:00:00 US/Eastern")
         .issuer_id("issuer")
         .description("description")
         .build()
@@ -459,7 +457,7 @@ fn setter_parity_with_contract_fields() {
     assert_eq!(combo_legs.len(), 1);
     assert_eq!(combo_legs[0].contract_id, 1);
     assert_eq!(delta_neutral_contract.unwrap().contract_id, 7);
-    assert_eq!(last_trade_date, Some(date));
+    assert_eq!(last_trade_date.as_deref(), Some("20241220 16:00:00 US/Eastern"));
     assert_eq!(issuer_id, "issuer");
     assert_eq!(description, "description");
 }
