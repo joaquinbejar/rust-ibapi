@@ -1390,3 +1390,51 @@ mod end_marker {
         assert_eq!(data.end, Some(datetime!(2023-03-15 10:30:00 UTC)));
     }
 }
+
+// === D14 item 5: IB's codes reach the caller with their text ===
+
+mod codes {
+    use super::*;
+    use crate::common::test_utils::helpers::{proto_response, text_response};
+    use crate::errors::Error;
+    use crate::messages::IncomingMessages;
+    use crate::testdata::builders::market_data::{full_historical_bar, HistoricalDataEndResponse, HistoricalDataResponse};
+    use crate::testdata::builders::ResponseProtoEncoder;
+
+    const PACING: &str = "Historical Market Data Service error message:Historical data request pacing violation";
+    const NO_TIME_ZONE: &str = "Warning: You submitted request with date-time attributes without explicit time zone.";
+
+    fn text_error(code: i32, text: &str) -> crate::messages::ResponseMessage {
+        let mut message = text_response(format!("4|{TEST_REQ_ID_FIRST}|{code}|{text}||"));
+        message.server_version = server_versions::ERROR_TIME;
+        message
+    }
+
+    fn fetch(responses: Vec<crate::messages::ResponseMessage>) -> Result<crate::market_data::historical::HistoricalData, Error> {
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(responses));
+        let mut client = Client::stubbed(message_bus, server_versions::PROTOBUF_HISTORICAL_DATA);
+        client.time_zone = Some(time_tz::timezones::db::UTC);
+        client
+            .historical_data(&Contract::stock("MSFT").build(), BarSize::Hour)
+            .duration(Duration::days(1))
+            .fetch()
+    }
+
+    #[test]
+    fn informational_code_is_kept_and_terminal_code_ends_the_answer() {
+        let data = proto_response(
+            IncomingMessages::HistoricalData,
+            HistoricalDataResponse::default().bar(full_historical_bar()).encode_proto(),
+        );
+        let end = proto_response(IncomingMessages::HistoricalDataEnd, HistoricalDataEndResponse::default().encode_proto());
+
+        let answer = fetch(vec![text_error(2174, NO_TIME_ZONE), data.clone(), end]).expect("still completes");
+        assert_eq!(answer.notices.len(), 1);
+        assert_eq!((answer.notices[0].code, answer.notices[0].message.as_str()), (2174, NO_TIME_ZONE));
+
+        match fetch(vec![data, text_error(162, PACING)]) {
+            Err(Error::Notice(notice)) => assert_eq!((notice.code, notice.message.as_str()), (162, PACING)),
+            other => panic!("expected IB's 162, got {other:?}"),
+        }
+    }
+}

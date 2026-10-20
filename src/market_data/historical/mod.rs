@@ -23,7 +23,7 @@ use thiserror::Error;
 use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
 
-use crate::messages::{IncomingMessages, ResponseMessage};
+use crate::messages::{IncomingMessages, Notice, ResponseMessage};
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
 
@@ -366,6 +366,31 @@ pub struct HistoricalData {
     pub end: Option<OffsetDateTime>,
     /// Bar data returned by the request.
     pub bars: Vec<Bar>,
+    /// The notices IB sent for this request before its answer ended, in the
+    /// order they arrived, each with IB's code and text: the warnings that do
+    /// not end a request ([`HISTORICAL_DATA_NOTICE_CODES`] and the 2100-2169
+    /// range). Empty on the streaming variant, which yields its notices as
+    /// [`SubscriptionItem::Notice`](crate::subscriptions::SubscriptionItem::Notice).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<Notice>,
+}
+
+/// IB codes that inform about a historical data request without ending it,
+/// beyond the 2100-2169 warnings every request treats that way.
+///
+/// - 2174: the request's date-time has no explicit time zone; IB still serves
+///   it.
+///
+/// A one-shot request ([`HistoricalDataBuilder::fetch`],
+/// `HistoricalDataRequest`) keeps them in [`HistoricalData::notices`] and
+/// keeps waiting for its answer. Any other error code for the request ends it
+/// as [`Error::Notice`], with IB's code and text.
+pub const HISTORICAL_DATA_NOTICE_CODES: [i32; 1] = [2174];
+
+/// Whether an IB code bound to a historical data request informs about it
+/// without ending it.
+pub(crate) fn is_historical_data_notice(code: i32) -> bool {
+    crate::transport::routing::is_warning_error(code) || HISTORICAL_DATA_NOTICE_CODES.contains(&code)
 }
 
 /// Update from historical data streaming with keepUpToDate=true.

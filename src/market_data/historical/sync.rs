@@ -286,7 +286,7 @@ pub(crate) fn historical_data(
     // answer is complete only on IB's end marker.
     let mut answer = common::HistoricalAnswer::new(request_id, client.server_version, time_zone(client));
     loop {
-        if let Some(result) = answer.accept(subscription.next()) {
+        if let Some(result) = answer.accept(subscription.next_routed()) {
             return result;
         }
     }

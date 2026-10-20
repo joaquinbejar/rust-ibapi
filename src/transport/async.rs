@@ -320,21 +320,27 @@ impl AsyncInternalSubscription {
     /// `None`: a request that collects rows until its end marker must not
     /// return the rows around a hole as the whole answer.
     pub async fn next(&mut self) -> Option<Result<ResponseMessage, Error>> {
+        loop {
+            if let Some(legacy) = self.next_item().await?.into_legacy() {
+                return Some(legacy);
+            }
+        }
+    }
+
+    /// The next item as the dispatcher classified it, notices included: the
+    /// caller sees every notice bound to its request id, which [`next`](Self::next)
+    /// skips. A channel that dropped messages yields an [`Error::Lagged`] item
+    /// once and then `None`, as `next` does.
+    pub(crate) async fn next_item(&mut self) -> Option<RoutedItem> {
         if self.lagged {
             return None;
         }
-        loop {
-            match self.stream.next().await? {
-                Ok(item) => {
-                    if let Some(legacy) = item.into_legacy() {
-                        return Some(legacy);
-                    }
-                }
-                Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                    warn!("subscription channel lagged, dropped {skipped} messages; ending it");
-                    self.lagged = true;
-                    return Some(Err(Error::Lagged(skipped)));
-                }
+        match self.stream.next().await? {
+            Ok(item) => Some(item),
+            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                warn!("subscription channel lagged, dropped {skipped} messages; ending it");
+                self.lagged = true;
+                Some(RoutedItem::Error(Error::Lagged(skipped)))
             }
         }
     }

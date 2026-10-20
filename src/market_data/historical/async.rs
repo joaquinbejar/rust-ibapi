@@ -7,7 +7,7 @@ use time::OffsetDateTime;
 
 use crate::client::ClientRequestBuilders;
 use crate::contracts::Contract;
-use crate::messages::IncomingMessages;
+use crate::messages::{IncomingMessages, Notice};
 use crate::protocol::{check_version, Features};
 use crate::subscriptions::r#async::Subscription;
 use crate::transport::{AsyncInternalSubscription, AsyncMessageBus};
@@ -367,6 +367,14 @@ impl HistoricalDataRequest {
         self.state == RequestState::Open
     }
 
+    /// Every error and notice IB sent for this request so far, in the order
+    /// they arrived, each with IB's code and text; the one that ended it, if
+    /// IB ended it with an error, included. Readable after a timeout or an
+    /// error, when there is no [`HistoricalData`] to carry them.
+    pub fn notices(&self) -> &[Notice] {
+        self.answer.notices()
+    }
+
     /// Wait for the answer.
     ///
     /// `Ok` only once IB's end marker arrived, with the bars and IB's window.
@@ -408,7 +416,7 @@ impl HistoricalDataRequest {
             return Err(Error::Cancelled);
         }
         loop {
-            let item = self.subscription.next().await;
+            let item = self.subscription.next_item().await;
             if let Some(result) = self.answer.accept(item) {
                 self.state = RequestState::Ended;
                 self.ended = Some(result.clone());

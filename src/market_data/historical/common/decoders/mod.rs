@@ -36,6 +36,7 @@ pub(crate) fn decode_historical_data(server_version: i32, time_zone: &Tz, messag
                 start: None,
                 end: None,
                 bars,
+                notices: Vec::new(),
             })
         },
         |msg| {
@@ -89,7 +90,12 @@ pub(crate) fn decode_historical_data(server_version: i32, time_zone: &Tz, messag
                 })
             }
 
-            Ok(HistoricalData { start, end, bars })
+            Ok(HistoricalData {
+                start,
+                end,
+                bars,
+                notices: Vec::new(),
+            })
         },
     )
 }

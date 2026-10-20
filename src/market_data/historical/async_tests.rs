@@ -1334,3 +1334,134 @@ mod request_handle {
         assert_eq!(request_message_count(&message_bus), 1, "the request only, no cancel");
     }
 }
+
+// === D14 item 5: IB's codes reach the caller with their text ===
+
+mod codes {
+    use super::*;
+    use crate::common::test_utils::helpers::{proto_response, text_response};
+    use crate::messages::{IncomingMessages, Notice};
+    use crate::testdata::builders::market_data::{full_historical_bar, HistoricalDataEndResponse, HistoricalDataResponse};
+    use crate::testdata::builders::ResponseProtoEncoder;
+    use crate::transport::AsyncInternalSubscription;
+    use prost::Message;
+    use tokio::sync::broadcast;
+
+    const PACING: &str = "Historical Market Data Service error message:Historical data request pacing violation";
+    const COMPETING: &str = "No market data during competing live session";
+    const NO_TIME_ZONE: &str = "Warning: You submitted request with date-time attributes without explicit time zone.";
+
+    fn proto_data() -> crate::messages::ResponseMessage {
+        proto_response(
+            IncomingMessages::HistoricalData,
+            HistoricalDataResponse::default().bar(full_historical_bar()).encode_proto(),
+        )
+    }
+
+    fn proto_end() -> crate::messages::ResponseMessage {
+        proto_response(IncomingMessages::HistoricalDataEnd, HistoricalDataEndResponse::default().encode_proto())
+    }
+
+    fn proto_error(code: i32, text: &str) -> crate::messages::ResponseMessage {
+        let error = crate::proto::ErrorMessage {
+            id: Some(TEST_REQ_ID_FIRST),
+            error_code: Some(code),
+            error_msg: Some(text.to_owned()),
+            ..Default::default()
+        };
+        proto_response(IncomingMessages::Error, error.encode_to_vec())
+    }
+
+    /// An error frame in the text encoding of servers at or above ERROR_TIME.
+    fn text_error(code: i32, text: &str) -> crate::messages::ResponseMessage {
+        let mut message = text_response(format!("4|{TEST_REQ_ID_FIRST}|{code}|{text}||"));
+        message.server_version = server_versions::ERROR_TIME;
+        message
+    }
+
+    async fn send(responses: Vec<crate::messages::ResponseMessage>) -> HistoricalDataRequest {
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(responses));
+        let mut client = Client::stubbed(message_bus, server_versions::PROTOBUF_HISTORICAL_DATA);
+        client.time_zone = Some(time_tz::timezones::db::UTC);
+        client
+            .historical_data(&test_contract(), BarSize::Hour)
+            .duration(Duration::days(1))
+            .send()
+            .await
+            .expect("sent")
+    }
+
+    fn codes(notices: &[Notice]) -> Vec<(i32, &str)> {
+        notices.iter().map(|n| (n.code, n.message.as_str())).collect()
+    }
+
+    #[tokio::test]
+    async fn informational_codes_are_kept_and_do_not_end_the_answer() {
+        // Text and protobuf error frames alike: 2174 is IB telling the caller
+        // something about a request it still serves.
+        for notice in [text_error(2174, NO_TIME_ZONE), proto_error(2174, NO_TIME_ZONE)] {
+            let mut request = send(vec![notice, proto_data(), proto_end()]).await;
+
+            let data = request.answer().await.expect("the answer still completes");
+
+            assert_eq!(data.bars.len(), 1);
+            assert_eq!(codes(&data.notices), vec![(2174, NO_TIME_ZONE)]);
+            assert_eq!(codes(request.notices()), vec![(2174, NO_TIME_ZONE)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_codes_end_the_answer_with_their_code_and_text() {
+        // Negative control for the above: 162 (pacing) and 10197 (competing
+        // session) end the request, raw, on both encodings.
+        for (code, text) in [(162, PACING), (10197, COMPETING)] {
+            for error in [text_error(code, text), proto_error(code, text)] {
+                let mut request = send(vec![text_error(2174, NO_TIME_ZONE), error]).await;
+
+                match request.answer().await {
+                    Err(Error::Notice(notice)) => assert_eq!((notice.code, notice.message.as_str()), (code, text)),
+                    other => panic!("expected IB's {code}, got {other:?}"),
+                }
+                assert_eq!(
+                    codes(request.notices()),
+                    vec![(2174, NO_TIME_ZONE), (code, text)],
+                    "every code for the request, in order"
+                );
+                assert!(!request.is_open(), "IB ended it: nothing to cancel");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatcher_classified_codes_are_kept_in_order() {
+        // As the live dispatcher delivers them: a 2100-2169 warning as a
+        // Notice item, any other code as an Error item.
+        let (sender, receiver) = broadcast::channel(16);
+        let mut request = HistoricalDataRequest {
+            request_id: TEST_REQ_ID_FIRST,
+            subscription: AsyncInternalSubscription::new(receiver),
+            message_bus: Arc::new(MessageBusStub::default()),
+            answer: common::HistoricalAnswer::new(TEST_REQ_ID_FIRST, server_versions::PROTOBUF_HISTORICAL_DATA, time_tz::timezones::db::UTC),
+            state: RequestState::Open,
+            ended: None,
+        };
+        let notice = |code: i32, text: &str| Notice {
+            code,
+            message: text.to_owned(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        };
+        sender
+            .send(RoutedItem::Notice(notice(2107, "HMDS data farm connection is inactive")))
+            .unwrap();
+        sender.send(RoutedItem::Error(Error::Notice(notice(2174, NO_TIME_ZONE)))).unwrap();
+        sender.send(proto_data().into()).unwrap();
+        sender.send(RoutedItem::Error(Error::Notice(notice(162, PACING)))).unwrap();
+
+        assert!(matches!(request.answer().await, Err(Error::Notice(n)) if n.code == 162));
+        assert_eq!(
+            codes(request.notices()),
+            vec![(2107, "HMDS data farm connection is inactive"), (2174, NO_TIME_ZONE), (162, PACING)]
+        );
+    }
+}
