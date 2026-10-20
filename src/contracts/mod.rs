@@ -212,8 +212,10 @@ pub struct Contract {
     /// Delta and underlying price for Delta-Neutral combo orders. Underlying (STK or FUT), delta and underlying price goes into this attribute.
     pub delta_neutral_contract: Option<DeltaNeutralContract>,
 
-    /// The last trade date of the contract, returned by the server for derivatives.
-    pub last_trade_date: Option<time::Date>,
+    /// The contract's last trade date exactly as IB sent it (protobuf `Contract` tag 21),
+    /// e.g. `"20261016 16:00:00 US/Eastern"`. The text is kept verbatim and is not parsed.
+    /// `None` when IB left it out or sent an empty string.
+    pub last_trade_date: Option<String>,
 
     /// Identifier of the issuer for bonds and structured products.
     pub issuer_id: String,

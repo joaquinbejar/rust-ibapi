@@ -755,6 +755,18 @@ The sync client keeps `.fetch()` only: one request, end marker required, notices
 
 **`Error` gains `Interrupted(i32)` and `TimedOut(i32)`**, both carrying IB's request id. `Error` is `#[non_exhaustive]`, so matches already have a wildcard arm.
 
+### 31. `Contract.last_trade_date` is IB's text
+
+`Contract.last_trade_date` was `Option<time::Date>` and the protobuf decoder always left it `None`. It is now `Option<String>` and holds protobuf `Contract` tag 21 exactly as IB sent it, for example `"20261016 16:00:00 US/Eastern"`. The text is not parsed and does not fill `ContractDetails.last_trade_time`. An absent or empty tag 21 is `None`, as for the other `Option` fields of `Contract`. `ContractBuilder::last_trade_date` takes `impl Into<String>` instead of `time::Date`.
+
+```rust,ignore
+// v3 before
+let date: Option<time::Date> = details.contract.last_trade_date; // always None from IB
+
+// v3 now
+if let Some(text) = details.contract.last_trade_date.as_deref() { /* IB's tag 21, verbatim */ }
+```
+
 ## Before / after: common subscription patterns
 
 ### Order construction
