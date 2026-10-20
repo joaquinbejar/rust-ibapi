@@ -1,8 +1,8 @@
 use prost::Message;
 
-use crate::contracts::OptionComputation;
+use crate::contracts::{OptionComputation, OptionComputationRaw};
 use crate::messages::ResponseMessage;
-use crate::proto::decoders::{optional_f64, parse_f64, ts};
+use crate::proto::decoders::{parse_f64, ts};
 use crate::server_versions;
 use crate::Error;
 
@@ -314,18 +314,22 @@ pub(crate) fn decode_tick_generic_proto(bytes: &[u8]) -> Result<TickGeneric, Err
 pub(crate) fn decode_tick_option_computation_proto(bytes: &[u8]) -> Result<OptionComputation, Error> {
     let msg = crate::proto::TickOptionComputation::decode(bytes)?;
 
-    Ok(OptionComputation {
-        field: TickType::from(msg.tick_type.unwrap_or_default()),
-        tick_attribute: msg.tick_attrib,
-        implied_volatility: optional_f64(msg.implied_vol),
-        delta: optional_f64(msg.delta),
-        option_price: optional_f64(msg.opt_price),
-        present_value_dividend: optional_f64(msg.pv_dividend),
-        gamma: optional_f64(msg.gamma),
-        vega: optional_f64(msg.vega),
-        theta: optional_f64(msg.theta),
-        underlying_price: optional_f64(msg.und_price),
-    })
+    // An absent tick type is not type 0 (BidSize): the computation is unreadable.
+    let tick_type = msg
+        .tick_type
+        .ok_or_else(|| Error::parse_proto("tick_type", "missing in TickOptionComputation"))?;
+    let raw = OptionComputationRaw {
+        tick_type,
+        implied_volatility: msg.implied_vol,
+        delta: msg.delta,
+        option_price: msg.opt_price,
+        present_value_dividend: msg.pv_dividend,
+        gamma: msg.gamma,
+        vega: msg.vega,
+        theta: msg.theta,
+        underlying_price: msg.und_price,
+    };
+    Ok(OptionComputation::from_raw(raw, msg.tick_attrib))
 }
 
 pub(crate) fn decode_market_depth_proto(bytes: &[u8]) -> Result<MarketDepth, Error> {

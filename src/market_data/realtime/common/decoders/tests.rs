@@ -655,6 +655,104 @@ mod tick_option_computation_tests {
         };
         let result = decode_tick_option_computation_proto(&proto_msg.encode_to_vec()).expect("decode failed");
         assert_eq!(result.implied_volatility, None);
+        assert_eq!(result.raw.implied_volatility, Some(f64::MAX), "the unset maximum is kept raw");
+    }
+
+    // === D14 item 6 ===
+
+    fn decode(proto_msg: crate::proto::TickOptionComputation) -> Result<crate::contracts::OptionComputation, Error> {
+        // Through the production dispatch, as the market-data stream decodes it.
+        let mut message = ResponseMessage::from_protobuf(
+            crate::messages::IncomingMessages::TickOptionComputation as i32,
+            proto_msg.encode_to_vec(),
+            crate::server_versions::PROTOBUF_MARKET_DATA,
+        );
+        decode_tick_option_computation(&mut message)
+    }
+
+    #[test]
+    fn test_option_computation_proto_not_computed_sentinels_are_absent_and_kept_raw() {
+        // This decoded -1 and -2 as values: an implied volatility of -1.
+        let result = decode(crate::proto::TickOptionComputation {
+            req_id: Some(1),
+            tick_type: Some(13),
+            implied_vol: Some(-1.0),
+            delta: Some(-2.0),
+            opt_price: Some(-1.0),
+            pv_dividend: Some(-1.0),
+            gamma: Some(-2.0),
+            vega: Some(-2.0),
+            theta: Some(-2.0),
+            und_price: Some(-1.0),
+            ..Default::default()
+        })
+        .expect("decodes");
+
+        assert_eq!(
+            (
+                result.implied_volatility,
+                result.delta,
+                result.option_price,
+                result.present_value_dividend,
+                result.gamma,
+                result.vega,
+                result.theta,
+                result.underlying_price
+            ),
+            (None, None, None, None, None, None, None, None)
+        );
+        let raw = result.raw;
+        assert_eq!(
+            (raw.implied_volatility, raw.delta, raw.option_price, raw.gamma, raw.underlying_price),
+            (Some(-1.0), Some(-2.0), Some(-1.0), Some(-2.0), Some(-1.0)),
+            "each sentinel recorded as IB sent it"
+        );
+    }
+
+    #[test]
+    fn test_option_computation_proto_sentinels_are_per_field() {
+        // Negative control: -1 is not a greek's sentinel and -2 is not a
+        // price's, so a theta of -1 and a delta of -0.5 are values.
+        let result = decode(crate::proto::TickOptionComputation {
+            req_id: Some(1),
+            tick_type: Some(13),
+            implied_vol: Some(0.0),
+            delta: Some(-0.5),
+            theta: Some(-1.0),
+            und_price: Some(-2.0),
+            ..Default::default()
+        })
+        .expect("decodes");
+
+        assert_eq!(result.implied_volatility, Some(0.0));
+        assert_eq!(result.delta, Some(-0.5));
+        assert_eq!(result.theta, Some(-1.0));
+        assert_eq!(result.underlying_price, Some(-2.0));
+        assert_eq!(result.gamma, None, "absent");
+        assert_eq!(result.raw.gamma, None, "absent raw too: not sent");
+    }
+
+    #[test]
+    fn test_option_computation_proto_without_tick_type_is_an_error() {
+        // This decoded as tick type 0, BidSize.
+        let result = decode(crate::proto::TickOptionComputation {
+            req_id: Some(1),
+            implied_vol: Some(0.25),
+            ..Default::default()
+        });
+        assert!(matches!(result, Err(Error::Parse(..))), "got {result:?}");
+    }
+
+    #[test]
+    fn test_option_computation_proto_keeps_the_tick_type_number() {
+        let result = decode(crate::proto::TickOptionComputation {
+            req_id: Some(1),
+            tick_type: Some(999),
+            ..Default::default()
+        })
+        .expect("decodes");
+        assert_eq!(result.field, TickType::Unknown);
+        assert_eq!(result.raw.tick_type, 999, "an unknown tick type keeps its number");
     }
 }
 

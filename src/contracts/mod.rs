@@ -862,6 +862,13 @@ impl ToField for Vec<TagValue> {
 
 /// Receives option specific market data.
 /// TWS’s options model volatility, prices, and deltas, along with the present value of dividends expected on that options underlier.
+///
+/// Each value field is `Some` only for a value IB computed. It is `None` when
+/// IB left the value out, sent its unset maximum (`f64::MAX`), or sent its
+/// "not computed" sentinel: `-1` for the implied volatility and the prices
+/// (option price, dividend present value, underlying price), `-2` for the
+/// greeks (delta, gamma, vega, theta). [`raw`](Self::raw) keeps what IB sent
+/// for each, so the three cases stay apart and the sentinel can be recorded.
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Debug, Default)]
 pub struct OptionComputation {
@@ -885,6 +892,66 @@ pub struct OptionComputation {
     pub theta: Option<f64>,
     /// The price of the underlying.
     pub underlying_price: Option<f64>,
+    /// What IB sent, before any value was read as absent.
+    pub raw: OptionComputationRaw,
+}
+
+/// An option computation exactly as IB sent it: the tick type as its number
+/// (an unknown one included), and every value with its sentinels (`-1`, `-2`,
+/// `f64::MAX`) as numbers. A value is `None` only when IB left it out.
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct OptionComputationRaw {
+    /// The tick type number IB sent.
+    pub tick_type: i32,
+    /// Implied volatility as sent (`-1`: not computed).
+    pub implied_volatility: Option<f64>,
+    /// Delta as sent (`-2`: not computed).
+    pub delta: Option<f64>,
+    /// Option price as sent (`-1`: not computed).
+    pub option_price: Option<f64>,
+    /// Present value of dividends as sent (`-1`: not computed).
+    pub present_value_dividend: Option<f64>,
+    /// Gamma as sent (`-2`: not computed).
+    pub gamma: Option<f64>,
+    /// Vega as sent (`-2`: not computed).
+    pub vega: Option<f64>,
+    /// Theta as sent (`-2`: not computed).
+    pub theta: Option<f64>,
+    /// Underlying price as sent (`-1`: not computed).
+    pub underlying_price: Option<f64>,
+}
+
+/// IB's "not computed" sentinel for the implied volatility and the prices.
+pub const OPTION_PRICE_NOT_COMPUTED: f64 = -1.0;
+/// IB's "not computed" sentinel for the greeks.
+pub const OPTION_GREEK_NOT_COMPUTED: f64 = -2.0;
+
+impl OptionComputation {
+    /// The computation IB sent, each value `None` unless IB computed it.
+    pub(crate) fn from_raw(raw: OptionComputationRaw, tick_attribute: Option<i32>) -> Self {
+        let price = |value: Option<f64>| computed(value, OPTION_PRICE_NOT_COMPUTED);
+        let greek = |value: Option<f64>| computed(value, OPTION_GREEK_NOT_COMPUTED);
+        Self {
+            field: TickType::from(raw.tick_type),
+            tick_attribute,
+            implied_volatility: price(raw.implied_volatility),
+            delta: greek(raw.delta),
+            option_price: price(raw.option_price),
+            present_value_dividend: price(raw.present_value_dividend),
+            gamma: greek(raw.gamma),
+            vega: greek(raw.vega),
+            theta: greek(raw.theta),
+            underlying_price: price(raw.underlying_price),
+            raw,
+        }
+    }
+}
+
+/// A value IB computed: neither absent, nor unset (`f64::MAX`), nor the
+/// field's "not computed" sentinel.
+fn computed(value: Option<f64>, not_computed: f64) -> Option<f64> {
+    value.filter(|&v| v != f64::MAX && v != not_computed)
 }
 
 /// Option chain metadata for a specific underlying security.
