@@ -149,8 +149,8 @@ fn test_historical_data() {
 
     // Assert Response
 
-    assert_eq!(historical_data.start, datetime!(2023-04-13 16:31:22 UTC), "historical_data.start");
-    assert_eq!(historical_data.end, datetime!(2023-04-15 16:31:22 UTC), "historical_data.end");
+    assert_eq!(historical_data.start, Some(datetime!(2023-04-13 16:31:22 UTC)), "historical_data.start");
+    assert_eq!(historical_data.end, Some(datetime!(2023-04-15 16:31:22 UTC)), "historical_data.end");
     assert_eq!(historical_data.bars.len(), 2, "historical_data.bars.len()");
 
     assert_eq!(historical_data.bars[0].date, datetime!(2023-04-13 00:00:00 UTC), "bar.date");
@@ -688,14 +688,14 @@ fn test_historical_data_time_zone_handling() {
     // Start time should be 9:30 AM ET
     assert_eq!(
         historical_data.start,
-        datetime!(2023-04-13 09:30:00).assume_timezone(ny_zone).unwrap(),
+        Some(datetime!(2023-04-13 09:30:00).assume_timezone(ny_zone).unwrap()),
         "historical_data.start should be in NY timezone"
     );
 
     // End time should be 4:00 PM ET
     assert_eq!(
         historical_data.end,
-        datetime!(2023-04-15 16:00:00).assume_timezone(ny_zone).unwrap(),
+        Some(datetime!(2023-04-15 16:00:00).assume_timezone(ny_zone).unwrap()),
         "historical_data.end should be in NY timezone"
     );
 }
@@ -999,8 +999,8 @@ fn test_historical_data_with_end_message() {
         .expect("historical_data should succeed");
 
     assert_eq!(data.bars.len(), 1, "should have one bar");
-    assert_eq!(data.start, datetime!(2023-03-15 09:30:00 UTC), "start populated from end-message");
-    assert_eq!(data.end, datetime!(2023-03-15 10:30:00 UTC), "end populated from end-message");
+    assert_eq!(data.start, Some(datetime!(2023-03-15 09:30:00 UTC)), "start populated from end-message");
+    assert_eq!(data.end, Some(datetime!(2023-03-15 10:30:00 UTC)), "end populated from end-message");
 }
 
 #[test]
@@ -1322,4 +1322,71 @@ fn test_tick_subscription_skips_unexpected_message_then_yields() {
     let tick = subscription.next().expect("should receive tick after skipping unexpected");
     assert_eq!(tick.price, 14.00, "wrong price");
     assert!(subscription.next().is_none(), "should be done");
+}
+
+// === D14 item 1: the end marker is required ===
+
+mod end_marker {
+    use super::*;
+    use crate::common::test_utils::helpers::proto_response;
+    use crate::errors::Error;
+    use crate::market_data::historical::HistoricalData;
+    use crate::messages::IncomingMessages;
+    use crate::testdata::builders::market_data::{full_historical_bar, HistoricalDataEndResponse, HistoricalDataResponse};
+    use crate::testdata::builders::ResponseProtoEncoder;
+
+    fn fetch(message_bus: Arc<MessageBusStub>, server_version: i32) -> Result<HistoricalData, Error> {
+        let mut client = Client::stubbed(message_bus, server_version);
+        client.time_zone = Some(time_tz::timezones::db::UTC);
+        client
+            .historical_data(&Contract::stock("MSFT").build(), BarSize::Hour)
+            .duration(Duration::days(1))
+            .fetch()
+    }
+
+    fn proto_data() -> crate::messages::ResponseMessage {
+        proto_response(
+            IncomingMessages::HistoricalData,
+            HistoricalDataResponse::default().bar(full_historical_bar()).encode_proto(),
+        )
+    }
+
+    #[test]
+    fn text_answer_without_end_marker_is_interrupted() {
+        let message_bus = Arc::new(MessageBusStub::with_responses(vec![
+            "17\09000\01\01678886400\0185.50\0186.00\0185.25\0185.75\01000\0185.70\0100\0".to_owned(),
+        ]));
+
+        let result = fetch(message_bus.clone(), server_versions::HISTORICAL_DATA_END);
+
+        assert!(
+            matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+            "expected Interrupted, got {result:?}"
+        );
+        assert_eq!(request_message_count(&message_bus), 1);
+    }
+
+    #[test]
+    fn proto_answer_without_end_marker_is_interrupted() {
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_data()]));
+
+        let result = fetch(message_bus, server_versions::PROTOBUF_HISTORICAL_DATA);
+
+        assert!(
+            matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+            "expected Interrupted, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn proto_answer_with_end_marker_is_complete_with_ibs_window() {
+        let end = proto_response(IncomingMessages::HistoricalDataEnd, HistoricalDataEndResponse::default().encode_proto());
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_data(), end]));
+
+        let data = fetch(message_bus, server_versions::PROTOBUF_HISTORICAL_DATA).expect("complete answer");
+
+        assert_eq!(data.bars.len(), 1);
+        assert_eq!(data.start, Some(datetime!(2023-03-15 09:30:00 UTC)));
+        assert_eq!(data.end, Some(datetime!(2023-03-15 10:30:00 UTC)));
+    }
 }

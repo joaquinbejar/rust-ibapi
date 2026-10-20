@@ -31,10 +31,10 @@ pub(crate) fn decode_historical_data(server_version: i32, time_zone: &Tz, messag
     message.decode_proto_or_text(
         |bytes| {
             let bars = decode_historical_data_proto(bytes, time_zone)?;
-            // start/end come on the separate HistoricalDataEnd message in proto / newer-server flow.
+            // start/end come on the separate HistoricalDataEnd message: unknown until it arrives.
             Ok(HistoricalData {
-                start: OffsetDateTime::now_utc(),
-                end: OffsetDateTime::now_utc(),
+                start: None,
+                end: None,
                 bars,
             })
         },
@@ -48,11 +48,13 @@ pub(crate) fn decode_historical_data(server_version: i32, time_zone: &Tz, messag
 
             msg.skip(); // request_id
 
-            let mut start = OffsetDateTime::now_utc();
-            let mut end = OffsetDateTime::now_utc();
+            // Older servers state the window in the data message; newer ones in
+            // the separate HistoricalDataEnd, so it stays unknown here.
+            let mut start = None;
+            let mut end = None;
             if message_version > 2 && server_version < server_versions::HISTORICAL_DATA_END {
-                start = parse_date(&msg.next_string()?, time_zone)?;
-                end = parse_date(&msg.next_string()?, time_zone)?;
+                start = Some(parse_date(&msg.next_string()?, time_zone)?);
+                end = Some(parse_date(&msg.next_string()?, time_zone)?);
             }
 
             let mut bars = Vec::new();

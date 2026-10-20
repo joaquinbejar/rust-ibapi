@@ -824,8 +824,8 @@ async fn test_historical_data_with_end_message() {
         .expect("historical_data should succeed");
 
     assert_eq!(data.bars.len(), 1, "should have one bar");
-    assert_eq!(data.start, datetime!(2023-03-15 09:30:00 UTC), "start populated from end-message");
-    assert_eq!(data.end, datetime!(2023-03-15 10:30:00 UTC), "end populated from end-message");
+    assert_eq!(data.start, Some(datetime!(2023-03-15 09:30:00 UTC)), "start populated from end-message");
+    assert_eq!(data.end, Some(datetime!(2023-03-15 10:30:00 UTC)), "end populated from end-message");
 }
 
 #[tokio::test]
@@ -1049,4 +1049,112 @@ async fn test_tick_subscription_returns_none_on_closed_channel() {
         .expect("subscription should be created");
 
     assert!(subscription.next().await.is_none(), "closed channel yields None");
+}
+
+// === D14 item 1: the end marker is required ===
+
+mod end_marker {
+    use super::*;
+    use crate::common::test_utils::helpers::proto_response;
+    use crate::messages::IncomingMessages;
+    use crate::testdata::builders::market_data::{full_historical_bar, HistoricalDataEndResponse, HistoricalDataResponse};
+    use crate::testdata::builders::ResponseProtoEncoder;
+
+    async fn fetch(message_bus: Arc<MessageBusStub>, server_version: i32) -> Result<HistoricalData, Error> {
+        let mut client = Client::stubbed(message_bus, server_version);
+        client.time_zone = Some(time_tz::timezones::db::UTC);
+        client
+            .historical_data(&test_contract(), BarSize::Hour)
+            .duration(Duration::days(1))
+            .fetch()
+            .await
+    }
+
+    fn proto_data() -> crate::messages::ResponseMessage {
+        proto_response(
+            IncomingMessages::HistoricalData,
+            HistoricalDataResponse::default().bar(full_historical_bar()).encode_proto(),
+        )
+    }
+
+    fn proto_end() -> crate::messages::ResponseMessage {
+        proto_response(IncomingMessages::HistoricalDataEnd, HistoricalDataEndResponse::default().encode_proto())
+    }
+
+    #[tokio::test]
+    async fn text_answer_without_end_marker_is_interrupted() {
+        // The bars arrive, then the channel closes before HistoricalDataEnd.
+        // This returned Ok(bars) with a window of now_utc() before.
+        let message_bus = Arc::new(MessageBusStub::with_responses(vec![
+            "17|9000|1|1678886400|185.50|186.00|185.25|185.75|1000|185.70|100|".to_owned(),
+        ]));
+
+        let result = fetch(message_bus.clone(), server_versions::HISTORICAL_DATA_END).await;
+
+        assert!(
+            matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+            "expected Interrupted, got {result:?}"
+        );
+        assert_eq!(request_message_count(&message_bus), 1);
+    }
+
+    #[tokio::test]
+    async fn proto_answer_without_end_marker_is_interrupted() {
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_data()]));
+
+        let result = fetch(message_bus.clone(), server_versions::PROTOBUF_HISTORICAL_DATA).await;
+
+        assert!(
+            matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+            "expected Interrupted, got {result:?}"
+        );
+        assert_eq!(request_message_count(&message_bus), 1);
+    }
+
+    #[tokio::test]
+    async fn proto_answer_with_end_marker_is_complete_with_ibs_window() {
+        // Negative control for the two above: the same answer with its marker.
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_data(), proto_end()]));
+
+        let data = fetch(message_bus, server_versions::PROTOBUF_HISTORICAL_DATA)
+            .await
+            .expect("complete answer");
+
+        assert_eq!(data.bars.len(), 1);
+        assert_eq!(data.bars[0].close, Some(185.75));
+        assert_eq!(data.start, Some(datetime!(2023-03-15 09:30:00 UTC)), "start from the end marker");
+        assert_eq!(data.end, Some(datetime!(2023-03-15 10:30:00 UTC)), "end from the end marker");
+    }
+
+    #[tokio::test]
+    async fn end_marker_before_any_data_is_not_an_answer() {
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_end()]));
+
+        let result = fetch(message_bus, server_versions::PROTOBUF_HISTORICAL_DATA).await;
+
+        assert!(matches!(result, Err(Error::UnexpectedResponse(_))), "got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn stream_initial_batch_has_no_placeholder_window() {
+        // The streaming variant decodes the same data message: its window is
+        // unknown until IB states it, never now_utc().
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_data()]));
+        let client = Client::stubbed(message_bus, server_versions::PROTOBUF_HISTORICAL_DATA);
+
+        let mut subscription = client
+            .historical_data(&test_contract(), BarSize::Hour)
+            .duration(Duration::days(1))
+            .stream()
+            .await
+            .expect("stream");
+
+        match subscription.next().await {
+            Some(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Historical(data)))) => {
+                assert_eq!((data.start, data.end), (None, None));
+                assert_eq!(data.bars.len(), 1);
+            }
+            other => panic!("expected the initial batch, got {other:?}"),
+        }
+    }
 }

@@ -1169,3 +1169,86 @@ pub fn tick_string() -> TickStringResponse {
 pub fn tick_generic() -> TickGenericResponse {
     TickGenericResponse::default()
 }
+
+// =============================================================================
+// Historical bar response builders
+// =============================================================================
+
+/// A `HistoricalData` (17) answer. The bars are protobuf bars as IB would send
+/// them, so a test can leave any field out.
+#[derive(Clone, Debug)]
+pub struct HistoricalDataResponse {
+    pub request_id: i32,
+    pub bars: Vec<proto::HistoricalDataBar>,
+}
+
+impl Default for HistoricalDataResponse {
+    fn default() -> Self {
+        Self {
+            request_id: TEST_REQ_ID_FIRST,
+            bars: vec![],
+        }
+    }
+}
+
+impl HistoricalDataResponse {
+    pub fn bar(mut self, bar: proto::HistoricalDataBar) -> Self {
+        self.bars.push(bar);
+        self
+    }
+}
+
+impl ResponseProtoEncoder for HistoricalDataResponse {
+    type Proto = proto::HistoricalData;
+
+    fn to_proto(&self) -> Self::Proto {
+        proto::HistoricalData {
+            req_id: Some(self.request_id),
+            historical_data_bars: self.bars.clone(),
+        }
+    }
+}
+
+/// A full protobuf bar: 2023-04-10 13:30:00 UTC, every value present.
+pub fn full_historical_bar() -> proto::HistoricalDataBar {
+    proto::HistoricalDataBar {
+        date: Some("1681133400".into()),
+        open: Some(185.50),
+        high: Some(186.00),
+        low: Some(185.00),
+        close: Some(185.75),
+        volume: Some("1000".into()),
+        wap: Some("185.625".into()),
+        bar_count: Some(150),
+    }
+}
+
+/// A `HistoricalDataEnd` (108) marker with IB's stated window.
+#[derive(Clone, Debug)]
+pub struct HistoricalDataEndResponse {
+    pub request_id: i32,
+    pub start: String,
+    pub end: String,
+}
+
+impl Default for HistoricalDataEndResponse {
+    fn default() -> Self {
+        Self {
+            request_id: TEST_REQ_ID_FIRST,
+            start: "20230315 09:30:00 UTC".into(),
+            end: "20230315 10:30:00 UTC".into(),
+        }
+    }
+}
+
+impl ResponseProtoEncoder for HistoricalDataEndResponse {
+    type Proto = proto::HistoricalDataEnd;
+
+    fn to_proto(&self) -> Self::Proto {
+        proto::HistoricalDataEnd {
+            req_id: Some(self.request_id),
+            start_date_str: Some(self.start.clone()),
+            end_date_str: Some(self.end.clone()),
+        }
+    }
+}

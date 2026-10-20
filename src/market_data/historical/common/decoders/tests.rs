@@ -76,12 +76,12 @@ fn test_decode_historical_data() {
 
     assert_eq!(
         historical_data.start,
-        datetime!(2023-04-13 16:31:22).assume_timezone(time_zone).unwrap(),
+        Some(datetime!(2023-04-13 16:31:22).assume_timezone(time_zone).unwrap()),
         "historical_data.start"
     );
     assert_eq!(
         historical_data.end,
-        datetime!(2023-04-15 16:31:22).assume_timezone(time_zone).unwrap(),
+        Some(datetime!(2023-04-15 16:31:22).assume_timezone(time_zone).unwrap()),
         "historical_data.end"
     );
 
@@ -716,4 +716,25 @@ fn test_proto_daily_bar_time_reads_as_on_the_text_path() {
     });
     let data = decode_historical_data(server_versions::PROTOBUF_HISTORICAL_DATA, UTC, &mut message).expect("decodes");
     assert_eq!(data.bars[0].date, datetime!(2023-04-13 0:00:00 UTC));
+}
+
+// === D14 item 1: no placeholder window ===
+
+#[test]
+fn test_data_message_alone_states_no_window_on_either_path() {
+    let mut text = text_historical_data(&["1681133400", "1", "1", "1", "1", "1", "1", "1"]);
+    let data = decode_historical_data(server_versions::HISTORICAL_DATA_END, UTC, &mut text).expect("decodes");
+    assert_eq!(
+        (data.start, data.end),
+        (None, None),
+        "text: the window is the end marker's, not now_utc()"
+    );
+
+    let mut proto = proto_historical_data(full_proto_bar());
+    let data = decode_historical_data(server_versions::PROTOBUF_HISTORICAL_DATA, UTC, &mut proto).expect("decodes");
+    assert_eq!(
+        (data.start, data.end),
+        (None, None),
+        "protobuf: the window is the end marker's, not now_utc()"
+    );
 }

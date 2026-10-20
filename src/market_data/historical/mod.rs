@@ -356,10 +356,14 @@ pub struct HistogramEntry {
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoricalData {
-    /// Start timestamp of the requested window.
-    pub start: OffsetDateTime,
-    /// End timestamp of the requested window.
-    pub end: OffsetDateTime,
+    /// Start of the window, as IB stated it: from the `HistoricalDataEnd`
+    /// message (or, on servers older than `HISTORICAL_DATA_END`, from the data
+    /// message itself). `None` until IB states it, so a window IB never
+    /// confirmed cannot be read as a proven one.
+    pub start: Option<OffsetDateTime>,
+    /// End of the window, as IB stated it; `None` until IB states it, as
+    /// [`start`](Self::start).
+    pub end: Option<OffsetDateTime>,
     /// Bar data returned by the request.
     pub bars: Vec<Bar>,
 }

@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .fetch()
             .await?;
 
-        println!("Period: {} to {}", historical_data.start, historical_data.end);
+        println!("Period: {:?} to {:?}", historical_data.start, historical_data.end);
         println!("Total bars: {}", historical_data.bars.len());
 
         // Show first 5 and last 5 bars

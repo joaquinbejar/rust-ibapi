@@ -246,7 +246,7 @@ impl Client {
     }
 }
 
-pub(crate) fn time_zone(client: &Client) -> &time_tz::Tz {
+pub(crate) fn time_zone(client: &Client) -> &'static time_tz::Tz {
     if let Some(tz) = client.time_zone {
         tz
     } else {
@@ -282,25 +282,13 @@ pub(crate) fn historical_data(
 
     let subscription = builder.send_raw(request)?;
 
-    // A single attempt: a reset ends the call, and nothing else is sent.
-    match subscription.next() {
-        Some(Ok(mut message)) if message.message_type() == IncomingMessages::HistoricalData => {
-            let mut data = decoders::decode_historical_data(client.server_version, time_zone(client), &mut message)?;
-
-            if client.server_version >= crate::server_versions::HISTORICAL_DATA_END {
-                if let Some(Ok(mut end_msg)) = subscription.next() {
-                    let (start, end) = decoders::decode_historical_data_end(client.server_version, time_zone(client), &mut end_msg)?;
-                    data.start = start;
-                    data.end = end;
-                }
-            }
-
-            Ok(data)
+    // A single attempt: a reset ends the call, and nothing else is sent. The
+    // answer is complete only on IB's end marker.
+    let mut answer = common::HistoricalAnswer::new(request_id, client.server_version, time_zone(client));
+    loop {
+        if let Some(result) = answer.accept(subscription.next()) {
+            return result;
         }
-        Some(Ok(message)) if message.message_type() == IncomingMessages::Error => Err(Error::from(message)),
-        Some(Ok(message)) => Err(Error::unexpected_response(&message)),
-        Some(Err(Error::ConnectionReset)) | None => Err(Error::Interrupted(request_id)),
-        Some(Err(e)) => Err(e),
     }
 }
 

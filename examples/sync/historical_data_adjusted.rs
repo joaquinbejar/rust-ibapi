@@ -36,7 +36,7 @@ fn main() {
         .fetch()
         .expect("historical data request failed");
 
-    println!("start_date: {}, end_date: {}", historical_data.start, historical_data.end);
+    println!("start_date: {:?}, end_date: {:?}", historical_data.start, historical_data.end);
 
     for bar in &historical_data.bars {
         println!("{bar:?}");
