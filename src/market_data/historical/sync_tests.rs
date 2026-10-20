@@ -971,12 +971,13 @@ fn test_head_timestamp_unexpected_response() {
 fn test_head_timestamp_end_of_stream() {
     // Empty response set → channel closes → subscription.next() yields None.
     let message_bus = Arc::new(MessageBusStub::default());
-    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
     let result = client.head_timestamp(&Contract::stock("MSFT").build(), WhatToShow::Trades, TradingHours::Regular);
     assert!(
-        matches!(result, Err(Error::UnexpectedEndOfStream)),
-        "expected UnexpectedEndOfStream, got {result:?}"
+        matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+        "expected Interrupted, got {result:?}"
     );
+    assert_eq!(request_message_count(&message_bus), 1, "an interrupted request is not sent again");
 }
 
 #[test]
@@ -1003,9 +1004,9 @@ fn test_historical_data_with_end_message() {
 }
 
 #[test]
-fn test_historical_data_connection_reset_after_retries() {
-    // Empty responses → channel closes immediately → subscription.next() returns
-    // None on every retry → loop exhausts MAX_RETRIES and returns ConnectionReset.
+fn test_historical_data_interrupted_is_not_retried() {
+    // Empty responses → channel closes immediately → the single attempt ends
+    // Interrupted, and no second request goes out.
     let message_bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
 
@@ -1014,11 +1015,11 @@ fn test_historical_data_connection_reset_after_retries() {
         .duration(Duration::days(1))
         .fetch();
 
-    // The first None response returns UnexpectedEndOfStream (the loop early-exits).
     assert!(
-        matches!(result, Err(Error::UnexpectedEndOfStream)),
-        "expected UnexpectedEndOfStream, got {result:?}"
+        matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+        "expected Interrupted, got {result:?}"
     );
+    assert_eq!(request_message_count(&message_bus), 1, "an interrupted request is not sent again");
 }
 
 #[test]
@@ -1099,12 +1100,13 @@ fn test_historical_schedule_unexpected_response() {
 #[test]
 fn test_historical_schedule_end_of_stream() {
     let message_bus = Arc::new(MessageBusStub::default());
-    let client = Client::stubbed(message_bus, server_versions::HISTORICAL_SCHEDULE);
+    let client = Client::stubbed(message_bus.clone(), server_versions::HISTORICAL_SCHEDULE);
     let result = client.historical_schedules(&Contract::stock("MSFT").build(), Duration::days(1)).fetch();
     assert!(
-        matches!(result, Err(Error::UnexpectedEndOfStream)),
-        "expected UnexpectedEndOfStream, got {result:?}"
+        matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+        "expected Interrupted, got {result:?}"
     );
+    assert_eq!(request_message_count(&message_bus), 1, "an interrupted request is not sent again");
 }
 
 #[test]
@@ -1131,16 +1133,18 @@ fn test_histogram_data_version_check() {
 }
 
 #[test]
-fn test_histogram_data_empty_response_returns_empty_vec() {
-    // None on the first subscription.next() → returns an empty Vec.
+fn test_histogram_data_closed_channel_is_interrupted_not_empty() {
+    // None on the first subscription.next(): no answer, not an empty histogram.
     let message_bus = Arc::new(MessageBusStub::default());
-    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
 
-    let histogram = client
-        .histogram_data(&Contract::stock("MSFT").build(), TradingHours::Regular, BarSize::Day)
-        .expect("histogram_data should succeed with empty result");
+    let result = client.histogram_data(&Contract::stock("MSFT").build(), TradingHours::Regular, BarSize::Day);
 
-    assert!(histogram.is_empty(), "expected empty histogram, got {histogram:?}");
+    assert!(
+        matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+        "expected Interrupted, got {result:?}"
+    );
+    assert_eq!(request_message_count(&message_bus), 1, "an interrupted request is not sent again");
 }
 
 #[test]

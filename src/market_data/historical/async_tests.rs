@@ -829,9 +829,10 @@ async fn test_historical_data_with_end_message() {
 }
 
 #[tokio::test]
-async fn test_historical_data_connection_reset_after_retries() {
-    // Empty responses → broadcast channel closes immediately → subscription.next()
-    // returns None on every retry → loop exhausts MAX_RETRIES and returns ConnectionReset.
+async fn test_historical_data_interrupted_is_not_retried() {
+    // Empty responses → broadcast channel closes immediately. The single
+    // attempt ends Interrupted with its request id, and nothing else is sent
+    // (this sent five requests under five ids before).
     let message_bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
 
@@ -841,9 +842,54 @@ async fn test_historical_data_connection_reset_after_retries() {
         .fetch()
         .await;
 
-    assert!(matches!(result, Err(Error::ConnectionReset)), "expected ConnectionReset, got {result:?}");
-    // Each retry resends the request — MAX_RETRIES = 5.
-    assert_eq!(request_message_count(&message_bus), 5, "should retry MAX_RETRIES times");
+    assert!(
+        matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+        "expected Interrupted, got {result:?}"
+    );
+    assert_eq!(request_message_count(&message_bus), 1, "an interrupted request is not sent again");
+}
+
+#[tokio::test]
+async fn test_head_timestamp_interrupted_is_not_retried() {
+    // This recursed into a new request, without bound, on every closed channel.
+    let message_bus = Arc::new(MessageBusStub::default());
+    let client = Client::stubbed(message_bus.clone(), server_versions::BOND_ISSUERID);
+
+    let result = client.head_timestamp(&test_contract(), WhatToShow::Trades, TradingHours::Regular).await;
+
+    assert!(
+        matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+        "expected Interrupted, got {result:?}"
+    );
+    assert_eq!(request_message_count(&message_bus), 1, "an interrupted request is not sent again");
+}
+
+#[tokio::test]
+async fn test_histogram_data_interrupted_is_not_retried() {
+    let message_bus = Arc::new(MessageBusStub::default());
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
+
+    let result = client.histogram_data(&test_contract(), TradingHours::Regular, BarSize::Day).await;
+
+    assert!(
+        matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+        "expected Interrupted, got {result:?}"
+    );
+    assert_eq!(request_message_count(&message_bus), 1, "an interrupted request is not sent again");
+}
+
+#[tokio::test]
+async fn test_historical_schedules_interrupted_is_not_retried() {
+    let message_bus = Arc::new(MessageBusStub::default());
+    let client = Client::stubbed(message_bus.clone(), server_versions::HISTORICAL_SCHEDULE);
+
+    let result = client.historical_schedules(&test_contract(), Duration::days(1)).fetch().await;
+
+    assert!(
+        matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+        "expected Interrupted, got {result:?}"
+    );
+    assert_eq!(request_message_count(&message_bus), 1, "an interrupted request is not sent again");
 }
 
 #[tokio::test]

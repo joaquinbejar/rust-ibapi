@@ -55,6 +55,7 @@ fn error_display() {
         (Error::Shutdown, "Shutdown"),
         (Error::EndOfStream, "EndOfStream"),
         (Error::UnexpectedEndOfStream, "UnexpectedEndOfStream"),
+        (Error::Interrupted(9000), "Interrupted: request 9000 ended before IB completed its answer"),
         (tws_error_notice(200, "No security found"), "[200] No security found"),
         (Error::AlreadySubscribed, "AlreadySubscribed"),
         (
@@ -248,6 +249,7 @@ fn clone_preserves_payloaded_variants() {
         Error::unexpected_response(&response),
         tws_error_notice(404, "nope"),
         Error::HistoricalParseError(HistoricalParseError::WhatToShow("Z".into())),
+        Error::Interrupted(9000),
         Error::ProtobufDecode(protobuf_decode_error()),
     ];
 

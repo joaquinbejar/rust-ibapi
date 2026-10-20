@@ -117,6 +117,16 @@ pub enum Error {
     #[error("UnexpectedEndOfStream")]
     UnexpectedEndOfStream,
 
+    /// The request's answer ended before IB completed it: its channel closed,
+    /// or the connection was reset, before the end marker (or the single
+    /// answer message) arrived. Carries IB's request id.
+    ///
+    /// Nothing was sent again: a request that ends this way is not retried
+    /// under a new id, and what arrived before the interruption is not
+    /// returned as the answer. Whether to ask again is the caller's decision.
+    #[error("Interrupted: request {0} ended before IB completed its answer")]
+    Interrupted(i32),
+
     /// The subscription's channel overflowed and dropped this many messages.
     ///
     /// Whatever the subscription delivered before is incomplete, and an end
@@ -230,6 +240,7 @@ impl Clone for Error {
             Error::EndOfStream => Error::EndOfStream,
             Error::UnexpectedResponse(m) => Error::UnexpectedResponse(m.clone()),
             Error::UnexpectedEndOfStream => Error::UnexpectedEndOfStream,
+            Error::Interrupted(request_id) => Error::Interrupted(*request_id),
             Error::Lagged(skipped) => Error::Lagged(*skipped),
             Error::Notice(n) => Error::Notice(n.clone()),
             Error::AlreadySubscribed => Error::AlreadySubscribed,
