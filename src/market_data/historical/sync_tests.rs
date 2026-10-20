@@ -149,18 +149,18 @@ fn test_historical_data() {
 
     // Assert Response
 
-    assert_eq!(historical_data.start, datetime!(2023-04-13 16:31:22 UTC), "historical_data.start");
-    assert_eq!(historical_data.end, datetime!(2023-04-15 16:31:22 UTC), "historical_data.end");
+    assert_eq!(historical_data.start, Some(datetime!(2023-04-13 16:31:22 UTC)), "historical_data.start");
+    assert_eq!(historical_data.end, Some(datetime!(2023-04-15 16:31:22 UTC)), "historical_data.end");
     assert_eq!(historical_data.bars.len(), 2, "historical_data.bars.len()");
 
     assert_eq!(historical_data.bars[0].date, datetime!(2023-04-13 00:00:00 UTC), "bar.date");
-    assert_eq!(historical_data.bars[0].open, 182.94, "bar.open");
-    assert_eq!(historical_data.bars[0].high, 186.50, "bar.high");
-    assert_eq!(historical_data.bars[0].low, 180.94, "bar.low");
-    assert_eq!(historical_data.bars[0].close, 185.90, "bar.close");
-    assert_eq!(historical_data.bars[0].volume, 948837.22, "bar.volume");
-    assert_eq!(historical_data.bars[0].wap, 184.869, "bar.wap");
-    assert_eq!(historical_data.bars[0].count, 324891, "bar.count");
+    assert_eq!(historical_data.bars[0].open, Some(182.94), "bar.open");
+    assert_eq!(historical_data.bars[0].high, Some(186.50), "bar.high");
+    assert_eq!(historical_data.bars[0].low, Some(180.94), "bar.low");
+    assert_eq!(historical_data.bars[0].close, Some(185.90), "bar.close");
+    assert_eq!(historical_data.bars[0].volume, Some(948837.22), "bar.volume");
+    assert_eq!(historical_data.bars[0].wap, Some(184.869), "bar.wap");
+    assert_eq!(historical_data.bars[0].count, Some(324891), "bar.count");
 
     // Assert Request
     assert_eq!(request_message_count(&message_bus), 1);
@@ -688,14 +688,14 @@ fn test_historical_data_time_zone_handling() {
     // Start time should be 9:30 AM ET
     assert_eq!(
         historical_data.start,
-        datetime!(2023-04-13 09:30:00).assume_timezone(ny_zone).unwrap(),
+        Some(datetime!(2023-04-13 09:30:00).assume_timezone(ny_zone).unwrap()),
         "historical_data.start should be in NY timezone"
     );
 
     // End time should be 4:00 PM ET
     assert_eq!(
         historical_data.end,
-        datetime!(2023-04-15 16:00:00).assume_timezone(ny_zone).unwrap(),
+        Some(datetime!(2023-04-15 16:00:00).assume_timezone(ny_zone).unwrap()),
         "historical_data.end should be in NY timezone"
     );
 }
@@ -761,7 +761,7 @@ fn test_historical_data_streaming_with_updates() {
     match update1.unwrap().expect("expected Ok") {
         HistoricalBarUpdate::Historical(data) => {
             assert_eq!(data.bars.len(), 1, "Should have 1 initial bar");
-            assert_eq!(data.bars[0].open, 185.50, "Wrong open price");
+            assert_eq!(data.bars[0].open, Some(185.50), "Wrong open price");
         }
         _ => panic!("Expected Historical variant"),
     }
@@ -771,9 +771,9 @@ fn test_historical_data_streaming_with_updates() {
     assert!(update2.is_some(), "Should receive streaming update");
     match update2.unwrap().expect("expected Ok") {
         HistoricalBarUpdate::Update(bar) => {
-            assert_eq!(bar.open, 185.80, "Wrong open price in update");
-            assert_eq!(bar.high, 186.10, "Wrong high price in update");
-            assert_eq!(bar.close, 185.90, "Wrong close price in update");
+            assert_eq!(bar.open, Some(185.80), "Wrong open price in update");
+            assert_eq!(bar.high, Some(186.10), "Wrong high price in update");
+            assert_eq!(bar.close, Some(185.90), "Wrong close price in update");
         }
         _ => panic!("Expected Update variant"),
     }
@@ -971,12 +971,13 @@ fn test_head_timestamp_unexpected_response() {
 fn test_head_timestamp_end_of_stream() {
     // Empty response set → channel closes → subscription.next() yields None.
     let message_bus = Arc::new(MessageBusStub::default());
-    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
     let result = client.head_timestamp(&Contract::stock("MSFT").build(), WhatToShow::Trades, TradingHours::Regular);
     assert!(
-        matches!(result, Err(Error::UnexpectedEndOfStream)),
-        "expected UnexpectedEndOfStream, got {result:?}"
+        matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+        "expected Interrupted, got {result:?}"
     );
+    assert_eq!(request_message_count(&message_bus), 1, "an interrupted request is not sent again");
 }
 
 #[test]
@@ -998,14 +999,14 @@ fn test_historical_data_with_end_message() {
         .expect("historical_data should succeed");
 
     assert_eq!(data.bars.len(), 1, "should have one bar");
-    assert_eq!(data.start, datetime!(2023-03-15 09:30:00 UTC), "start populated from end-message");
-    assert_eq!(data.end, datetime!(2023-03-15 10:30:00 UTC), "end populated from end-message");
+    assert_eq!(data.start, Some(datetime!(2023-03-15 09:30:00 UTC)), "start populated from end-message");
+    assert_eq!(data.end, Some(datetime!(2023-03-15 10:30:00 UTC)), "end populated from end-message");
 }
 
 #[test]
-fn test_historical_data_connection_reset_after_retries() {
-    // Empty responses → channel closes immediately → subscription.next() returns
-    // None on every retry → loop exhausts MAX_RETRIES and returns ConnectionReset.
+fn test_historical_data_interrupted_is_not_retried() {
+    // Empty responses → channel closes immediately → the single attempt ends
+    // Interrupted, and no second request goes out.
     let message_bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
 
@@ -1014,11 +1015,11 @@ fn test_historical_data_connection_reset_after_retries() {
         .duration(Duration::days(1))
         .fetch();
 
-    // The first None response returns UnexpectedEndOfStream (the loop early-exits).
     assert!(
-        matches!(result, Err(Error::UnexpectedEndOfStream)),
-        "expected UnexpectedEndOfStream, got {result:?}"
+        matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+        "expected Interrupted, got {result:?}"
     );
+    assert_eq!(request_message_count(&message_bus), 1, "an interrupted request is not sent again");
 }
 
 #[test]
@@ -1099,12 +1100,13 @@ fn test_historical_schedule_unexpected_response() {
 #[test]
 fn test_historical_schedule_end_of_stream() {
     let message_bus = Arc::new(MessageBusStub::default());
-    let client = Client::stubbed(message_bus, server_versions::HISTORICAL_SCHEDULE);
+    let client = Client::stubbed(message_bus.clone(), server_versions::HISTORICAL_SCHEDULE);
     let result = client.historical_schedules(&Contract::stock("MSFT").build(), Duration::days(1)).fetch();
     assert!(
-        matches!(result, Err(Error::UnexpectedEndOfStream)),
-        "expected UnexpectedEndOfStream, got {result:?}"
+        matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+        "expected Interrupted, got {result:?}"
     );
+    assert_eq!(request_message_count(&message_bus), 1, "an interrupted request is not sent again");
 }
 
 #[test]
@@ -1131,16 +1133,18 @@ fn test_histogram_data_version_check() {
 }
 
 #[test]
-fn test_histogram_data_empty_response_returns_empty_vec() {
-    // None on the first subscription.next() → returns an empty Vec.
+fn test_histogram_data_closed_channel_is_interrupted_not_empty() {
+    // None on the first subscription.next(): no answer, not an empty histogram.
     let message_bus = Arc::new(MessageBusStub::default());
-    let client = Client::stubbed(message_bus, server_versions::SIZE_RULES);
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
 
-    let histogram = client
-        .histogram_data(&Contract::stock("MSFT").build(), TradingHours::Regular, BarSize::Day)
-        .expect("histogram_data should succeed with empty result");
+    let result = client.histogram_data(&Contract::stock("MSFT").build(), TradingHours::Regular, BarSize::Day);
 
-    assert!(histogram.is_empty(), "expected empty histogram, got {histogram:?}");
+    assert!(
+        matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+        "expected Interrupted, got {result:?}"
+    );
+    assert_eq!(request_message_count(&message_bus), 1, "an interrupted request is not sent again");
 }
 
 #[test]
@@ -1318,4 +1322,119 @@ fn test_tick_subscription_skips_unexpected_message_then_yields() {
     let tick = subscription.next().expect("should receive tick after skipping unexpected");
     assert_eq!(tick.price, 14.00, "wrong price");
     assert!(subscription.next().is_none(), "should be done");
+}
+
+// === D14 item 1: the end marker is required ===
+
+mod end_marker {
+    use super::*;
+    use crate::common::test_utils::helpers::proto_response;
+    use crate::errors::Error;
+    use crate::market_data::historical::HistoricalData;
+    use crate::messages::IncomingMessages;
+    use crate::testdata::builders::market_data::{full_historical_bar, HistoricalDataEndResponse, HistoricalDataResponse};
+    use crate::testdata::builders::ResponseProtoEncoder;
+
+    fn fetch(message_bus: Arc<MessageBusStub>, server_version: i32) -> Result<HistoricalData, Error> {
+        let mut client = Client::stubbed(message_bus, server_version);
+        client.time_zone = Some(time_tz::timezones::db::UTC);
+        client
+            .historical_data(&Contract::stock("MSFT").build(), BarSize::Hour)
+            .duration(Duration::days(1))
+            .fetch()
+    }
+
+    fn proto_data() -> crate::messages::ResponseMessage {
+        proto_response(
+            IncomingMessages::HistoricalData,
+            HistoricalDataResponse::default().bar(full_historical_bar()).encode_proto(),
+        )
+    }
+
+    #[test]
+    fn text_answer_without_end_marker_is_interrupted() {
+        let message_bus = Arc::new(MessageBusStub::with_responses(vec![
+            "17\09000\01\01678886400\0185.50\0186.00\0185.25\0185.75\01000\0185.70\0100\0".to_owned(),
+        ]));
+
+        let result = fetch(message_bus.clone(), server_versions::HISTORICAL_DATA_END);
+
+        assert!(
+            matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+            "expected Interrupted, got {result:?}"
+        );
+        assert_eq!(request_message_count(&message_bus), 1);
+    }
+
+    #[test]
+    fn proto_answer_without_end_marker_is_interrupted() {
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_data()]));
+
+        let result = fetch(message_bus, server_versions::PROTOBUF_HISTORICAL_DATA);
+
+        assert!(
+            matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+            "expected Interrupted, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn proto_answer_with_end_marker_is_complete_with_ibs_window() {
+        let end = proto_response(IncomingMessages::HistoricalDataEnd, HistoricalDataEndResponse::default().encode_proto());
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_data(), end]));
+
+        let data = fetch(message_bus, server_versions::PROTOBUF_HISTORICAL_DATA).expect("complete answer");
+
+        assert_eq!(data.bars.len(), 1);
+        assert_eq!(data.start, Some(datetime!(2023-03-15 09:30:00 UTC)));
+        assert_eq!(data.end, Some(datetime!(2023-03-15 10:30:00 UTC)));
+    }
+}
+
+// === D14 item 5: IB's codes reach the caller with their text ===
+
+mod codes {
+    use super::*;
+    use crate::common::test_utils::helpers::{proto_response, text_response};
+    use crate::errors::Error;
+    use crate::messages::IncomingMessages;
+    use crate::testdata::builders::market_data::{full_historical_bar, HistoricalDataEndResponse, HistoricalDataResponse};
+    use crate::testdata::builders::ResponseProtoEncoder;
+
+    const PACING: &str = "Historical Market Data Service error message:Historical data request pacing violation";
+    const NO_TIME_ZONE: &str = "Warning: You submitted request with date-time attributes without explicit time zone.";
+
+    fn text_error(code: i32, text: &str) -> crate::messages::ResponseMessage {
+        let mut message = text_response(format!("4|{TEST_REQ_ID_FIRST}|{code}|{text}||"));
+        message.server_version = server_versions::ERROR_TIME;
+        message
+    }
+
+    fn fetch(responses: Vec<crate::messages::ResponseMessage>) -> Result<crate::market_data::historical::HistoricalData, Error> {
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(responses));
+        let mut client = Client::stubbed(message_bus, server_versions::PROTOBUF_HISTORICAL_DATA);
+        client.time_zone = Some(time_tz::timezones::db::UTC);
+        client
+            .historical_data(&Contract::stock("MSFT").build(), BarSize::Hour)
+            .duration(Duration::days(1))
+            .fetch()
+    }
+
+    #[test]
+    fn informational_code_is_kept_and_terminal_code_ends_the_answer() {
+        let data = proto_response(
+            IncomingMessages::HistoricalData,
+            HistoricalDataResponse::default().bar(full_historical_bar()).encode_proto(),
+        );
+        let end = proto_response(IncomingMessages::HistoricalDataEnd, HistoricalDataEndResponse::default().encode_proto());
+
+        let answer = fetch(vec![text_error(2174, NO_TIME_ZONE), data.clone(), end]).expect("still completes");
+        assert_eq!(answer.notices.len(), 1);
+        assert_eq!((answer.notices[0].code, answer.notices[0].message.as_str()), (2174, NO_TIME_ZONE));
+
+        match fetch(vec![data, text_error(162, PACING)]) {
+            Err(Error::Notice(notice)) => assert_eq!((notice.code, notice.message.as_str()), (162, PACING)),
+            other => panic!("expected IB's 162, got {other:?}"),
+        }
+    }
 }

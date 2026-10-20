@@ -163,14 +163,11 @@ fn main() {
     let contract = Contract::stock("AAPL").build();
 
     let historical_data = client
-        .historical_data(
-            &contract,
-            Some(datetime!(2023-04-11 20:00 UTC)),
-            1.days(),
-            HistoricalBarSize::Hour,
-            HistoricalWhatToShow::Trades,
-            TradingHours::Regular,
-        )
+        .historical_data(&contract, HistoricalBarSize::Hour)
+        .what_to_show(HistoricalWhatToShow::Trades)
+        .duration(1.days())
+        .ending(datetime!(2023-04-11 20:00 UTC))
+        .fetch()
         .expect("historical data request failed");
 
     println!("start: {:?}, end: {:?}", historical_data.start, historical_data.end);
@@ -195,14 +192,11 @@ async fn main() {
     let contract = Contract::stock("AAPL").build();
 
     let historical_data = client
-        .historical_data(
-            &contract,
-            Some(datetime!(2023-04-11 20:00 UTC)),
-            1.days(),
-            HistoricalBarSize::Hour,
-            HistoricalWhatToShow::Trades,
-            TradingHours::Regular,
-        )
+        .historical_data(&contract, HistoricalBarSize::Hour)
+        .what_to_show(HistoricalWhatToShow::Trades)
+        .duration(1.days())
+        .ending(datetime!(2023-04-11 20:00 UTC))
+        .fetch()
         .await
         .expect("historical data request failed");
 
@@ -213,6 +207,8 @@ async fn main() {
     }
 }
 ```
+
+The window (`start`, `end`) and each bar's values are `Option`: `None` when IB did not state them. For the request id, a timeout or a cancel, use `.send()` instead of `.fetch()`; see [migration section 30](docs/migration-3.0.md#30-historical-data-absent-values-ibs-own-window-one-request-per-call).
 
 ### Requesting Realtime Market Data
 

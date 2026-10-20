@@ -1,6 +1,6 @@
 use crate::{contracts::tick_types::TickType, messages::ResponseMessage, server_versions, Error};
 
-use crate::contracts::{ContractDescription, ContractDetails, MarketRule, OptionChain, OptionComputation};
+use crate::contracts::{ContractDescription, ContractDetails, MarketRule, OptionChain, OptionComputation, OptionComputationRaw};
 
 // All originating outgoing-request gates for ContractData / SymbolSamples /
 // MarketRule / SecurityDefinitionOptionParameter are <= the connection floor
@@ -38,40 +38,47 @@ pub(crate) fn decode_option_computation(server_version: i32, message: &mut Respo
 
     message.skip(); // request id
 
-    let mut computation = OptionComputation {
-        field: TickType::from(message.next_int()?),
+    // An empty or unreadable tick type is an error (next_int), never type 0.
+    let mut raw = OptionComputationRaw {
+        tick_type: message.next_int()?,
         ..Default::default()
     };
+    let field = TickType::from(raw.tick_type);
 
-    if server_version >= server_versions::PRICE_BASED_VOLATILITY {
-        computation.tick_attribute = Some(message.next_int()?);
-    }
+    let tick_attribute = if server_version >= server_versions::PRICE_BASED_VOLATILITY {
+        Some(message.next_int()?)
+    } else {
+        None
+    };
 
-    computation.implied_volatility = next_optional_double(message, -1.0)?;
-    computation.delta = next_optional_double(message, -2.0)?;
+    raw.implied_volatility = next_raw_double(message)?;
+    raw.delta = next_raw_double(message)?;
 
-    if message_version >= 6 || computation.field == TickType::ModelOption || computation.field == TickType::DelayedModelOption {
-        computation.option_price = next_optional_double(message, -1.0)?;
-        computation.present_value_dividend = next_optional_double(message, -1.0)?;
+    if message_version >= 6 || field == TickType::ModelOption || field == TickType::DelayedModelOption {
+        raw.option_price = next_raw_double(message)?;
+        raw.present_value_dividend = next_raw_double(message)?;
     }
 
     if message_version >= 6 {
-        computation.gamma = next_optional_double(message, -2.0)?;
-        computation.vega = next_optional_double(message, -2.0)?;
-        computation.theta = next_optional_double(message, -2.0)?;
-        computation.underlying_price = next_optional_double(message, -1.0)?;
+        raw.gamma = next_raw_double(message)?;
+        raw.vega = next_raw_double(message)?;
+        raw.theta = next_raw_double(message)?;
+        raw.underlying_price = next_raw_double(message)?;
     }
 
-    Ok(computation)
+    Ok(OptionComputation::from_raw(raw, tick_attribute))
 }
 
-fn next_optional_double(message: &mut ResponseMessage, none_value: f64) -> Result<Option<f64>, Error> {
-    let value = message.next_double()?;
-    if value == none_value {
-        Ok(None)
-    } else {
-        Ok(Some(value))
+/// A value exactly as sent: `None` for an empty field (`next_double` reads it
+/// as `0.0`), the number otherwise, sentinels included.
+fn next_raw_double(message: &mut ResponseMessage) -> Result<Option<f64>, Error> {
+    let text = message.next_string()?;
+    if text.is_empty() {
+        return Ok(None);
     }
+    text.parse::<f64>()
+        .map(Some)
+        .map_err(|e| Error::parse_field(text, format!("option computation value: {e}")))
 }
 
 // === Protobuf decoders ===

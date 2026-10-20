@@ -387,8 +387,10 @@ pub struct Order {
     pub dont_use_auto_price_for_hedge: bool,
     /// Specifies the date to auto cancel the order.
     pub auto_cancel_date: String, // TODO date object
-    /// Specifies the initial order quantity to be filled.
-    pub filled_quantity: f64,
+    /// The quantity IB reports as filled for the order. `None` when IB did not
+    /// state it; a stated zero is `Some(0.0)`. A value that is not a number
+    /// fails the decode rather than reading as zero.
+    pub filled_quantity: Option<f64>,
     /// Identifies the reference future conId.
     pub ref_futures_con_id: Option<i32>,
     /// Cancels the parent order if child order was cancelled.
@@ -577,7 +579,7 @@ impl Default for Order {
             mifid2_execution_algo: "".to_owned(),
             dont_use_auto_price_for_hedge: false,
             auto_cancel_date: "".to_owned(),
-            filled_quantity: 0.0,
+            filled_quantity: None,
             ref_futures_con_id: Some(0),
             auto_cancel_parent: false,
             shareholder: "".to_owned(),
@@ -690,14 +692,34 @@ impl Action {
     }
 
     /// Parse an action from the TWS string identifier.
+    ///
+    /// # Panics
+    /// On a string TWS never sends. A decoder reading the wire uses the
+    /// [`FromStr`](std::str::FromStr) implementation instead, which returns an
+    /// error, because a message from the broker is not a place to panic.
     pub fn from(name: &str) -> Self {
-        match name {
-            "BUY" => Self::Buy,
-            "SELL" => Self::Sell,
-            "SSHORT" => Self::SellShort,
-            "SLONG" => Self::SellLong,
-            &_ => todo!(),
+        match name.parse() {
+            Ok(action) => action,
+            Err(_) => panic!("unknown action {name:?}"),
         }
+    }
+
+    fn from_wire(name: &str) -> Option<Self> {
+        match name {
+            "BUY" => Some(Self::Buy),
+            "SELL" => Some(Self::Sell),
+            "SSHORT" => Some(Self::SellShort),
+            "SLONG" => Some(Self::SellLong),
+            _ => None,
+        }
+    }
+}
+
+impl std::str::FromStr for Action {
+    type Err = crate::Error;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::from_wire(name).ok_or_else(|| crate::Error::Parse(0, name.to_string(), "unknown Action".into()))
     }
 }
 
@@ -1410,7 +1432,12 @@ pub struct CommissionReport {
     /// the execution's id this commission belongs to.
     pub execution_id: String,
     /// the commissions cost.
-    pub commission: f64,
+    /// The commission and fees, when the report carried them.
+    ///
+    /// `None` is a report without the field. It is not a commission of zero:
+    /// a fee that was not reported and a fee of nothing are different facts,
+    /// and only the second may be added to a total.
+    pub commission: Option<f64>,
     /// the reporting currency.
     pub currency: String,
     /// the realized profit and loss
@@ -1552,10 +1579,12 @@ pub struct OrderStatus {
     /// The current status of the order. See [`OrderStatusKind`] for variant
     /// definitions and helpers like [`is_terminal`](OrderStatusKind::is_terminal).
     pub status: OrderStatusKind,
-    /// Number of filled positions.
-    pub filled: f64,
-    /// The remnant positions.
-    pub remaining: f64,
+    /// Number of filled positions. `None` when IB did not state it; a stated
+    /// zero is `Some(0.0)`. A value that is not a number fails the decode
+    /// rather than reading as zero.
+    pub filled: Option<f64>,
+    /// The remnant positions, with the same three cases as `filled`.
+    pub remaining: Option<f64>,
     /// Average filling price. `None` when IBKR did not send a value (UNSET_DOUBLE on text protocol; missing optional field on protobuf).
     pub average_fill_price: Option<f64>,
     /// The order's permId used by the TWS to identify orders.

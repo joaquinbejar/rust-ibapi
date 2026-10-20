@@ -71,8 +71,8 @@ fn test_decode_order_status_proto() {
     let result = decode_order_status_proto(&bytes).unwrap();
     assert_eq!(result.order_id, 99);
     assert_eq!(result.status, OrderStatusKind::Filled);
-    assert_eq!(result.filled, 50.0);
-    assert_eq!(result.remaining, 0.0);
+    assert_eq!(result.filled, Some(50.0));
+    assert_eq!(result.remaining, Some(0.0));
     assert_eq!(result.average_fill_price, Some(152.5));
     assert_eq!(result.perm_id, 123456);
     assert_eq!(result.parent_id, 10);
@@ -156,7 +156,7 @@ fn test_decode_commission_report_proto() {
 
     let result = decode_commission_report_proto(&bytes).unwrap();
     assert_eq!(result.execution_id, "exec123");
-    assert_eq!(result.commission, 1.25);
+    assert_eq!(result.commission, Some(1.25));
     assert_eq!(result.currency, "USD");
     assert_eq!(result.realized_pnl, Some(500.0));
     assert_eq!(result.yields, None); // f64::MAX filtered out
@@ -310,8 +310,8 @@ fn test_decode_order_status_proto_round_trips_via_builder() {
     let result = super::decode_order_status_proto(&bytes).unwrap();
     assert_eq!(result.order_id, 99);
     assert_eq!(result.status, OrderStatusKind::Filled);
-    assert_eq!(result.filled, 50.0);
-    assert_eq!(result.remaining, 0.0);
+    assert_eq!(result.filled, Some(50.0));
+    assert_eq!(result.remaining, Some(0.0));
     assert_eq!(result.average_fill_price, Some(152.5));
     assert_eq!(result.perm_id, 123456);
     assert_eq!(result.last_fill_price, Some(152.75));
@@ -334,7 +334,7 @@ fn test_decode_commission_report_proto_round_trips_via_builder() {
 
     let result = super::decode_commission_report_proto(&bytes).unwrap();
     assert_eq!(result.execution_id, "exec123");
-    assert_eq!(result.commission, 1.25);
+    assert_eq!(result.commission, Some(1.25));
     assert_eq!(result.currency, "USD");
     assert_eq!(result.realized_pnl, Some(500.0));
     assert_eq!(result.yields, None); // f64::MAX is the IBKR sentinel for "unset"
@@ -425,4 +425,184 @@ fn test_decode_order_status_rejects_text_framing() {
         matches!(err, Error::UnexpectedResponse(_)),
         "expected Error::UnexpectedResponse, got {err:?}"
     );
+}
+
+#[test]
+fn test_decode_open_order_without_an_action_is_an_error_not_a_buy() {
+    // An order the broker described without a side. The decoder used to
+    // default it to BUY, so a working sell described this way would have been
+    // reported as a buy.
+    use prost::Message;
+
+    let proto_msg = crate::proto::OpenOrder {
+        order_id: Some(42),
+        contract: Some(crate::proto::Contract {
+            con_id: Some(265598),
+            ..Default::default()
+        }),
+        order: Some(crate::proto::Order {
+            order_id: Some(42),
+            action: None,
+            total_quantity: Some("100".into()),
+            ..Default::default()
+        }),
+        order_state: Some(crate::proto::OrderState {
+            status: Some("Submitted".into()),
+            ..Default::default()
+        }),
+    };
+    let mut bytes = Vec::new();
+    proto_msg.encode(&mut bytes).unwrap();
+
+    let result = decode_open_order_proto(&bytes);
+    assert!(result.is_err(), "an order without a side decoded as {:?}", result.map(|o| o.order.action));
+}
+
+#[test]
+fn test_decode_open_order_with_an_unknown_action_is_an_error_not_a_panic() {
+    use prost::Message;
+
+    let proto_msg = crate::proto::OpenOrder {
+        order_id: Some(42),
+        order: Some(crate::proto::Order {
+            order_id: Some(42),
+            action: Some("HOLD".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut bytes = Vec::new();
+    proto_msg.encode(&mut bytes).unwrap();
+
+    assert!(decode_open_order_proto(&bytes).is_err());
+}
+
+#[test]
+fn test_decode_commission_report_without_a_commission_is_none_not_zero() {
+    // A fee that was not reported and a fee of nothing are different facts,
+    // and only the second may be added to a total.
+    use prost::Message;
+
+    let absent = crate::proto::CommissionAndFeesReport {
+        exec_id: Some("0001.01".into()),
+        commission_and_fees: None,
+        currency: Some("USD".into()),
+        ..Default::default()
+    };
+    let mut bytes = Vec::new();
+    absent.encode(&mut bytes).unwrap();
+    let result = decode_commission_report_proto(&bytes).unwrap();
+    assert_eq!(result.commission, None);
+
+    let zero = crate::proto::CommissionAndFeesReport {
+        exec_id: Some("0001.01".into()),
+        commission_and_fees: Some(0.0),
+        currency: Some("USD".into()),
+        ..Default::default()
+    };
+    let mut bytes = Vec::new();
+    zero.encode(&mut bytes).unwrap();
+    let result = decode_commission_report_proto(&bytes).unwrap();
+    assert_eq!(result.commission, Some(0.0));
+}
+
+// Fill counts keep three cases apart: absent, a stated number (zero
+// included), and malformed. `parse_f64` answered 0.0 for all three, which
+// read an order IB said nothing about as one that filled nothing.
+
+fn order_status_bytes(filled: Option<&str>, remaining: Option<&str>) -> Vec<u8> {
+    use prost::Message;
+    crate::proto::OrderStatus {
+        order_id: Some(7),
+        status: Some("Submitted".into()),
+        filled: filled.map(str::to_owned),
+        remaining: remaining.map(str::to_owned),
+        perm_id: Some(700001),
+        client_id: Some(101),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
+#[test]
+fn test_order_status_counts_keep_absent_zero_and_stated_apart() {
+    let absent = super::decode_order_status_proto(&order_status_bytes(None, None)).unwrap();
+    assert_eq!(absent.filled, None);
+    assert_eq!(absent.remaining, None);
+    let empty = super::decode_order_status_proto(&order_status_bytes(Some(""), Some(""))).unwrap();
+    assert_eq!(empty.filled, None, "an empty string states nothing");
+    let zero = super::decode_order_status_proto(&order_status_bytes(Some("0"), Some("10"))).unwrap();
+    assert_eq!(zero.filled, Some(0.0), "a stated zero is a zero");
+    assert_eq!(zero.remaining, Some(10.0));
+    let decimal = super::decode_order_status_proto(&order_status_bytes(Some("2.5"), Some("7.5"))).unwrap();
+    assert_eq!(decimal.filled, Some(2.5));
+    assert_eq!(decimal.remaining, Some(7.5));
+    // IB's unset maximum is no count.
+    let unset = super::decode_order_status_proto(&order_status_bytes(Some(&f64::MAX.to_string()), None)).unwrap();
+    assert_eq!(unset.filled, None);
+}
+
+#[test]
+fn test_order_status_with_a_malformed_count_fails_to_decode() {
+    for (filled, remaining) in [(Some("ten"), Some("0")), (Some("1"), Some("NaN")), (Some("inf"), None)] {
+        let decoded = super::decode_order_status_proto(&order_status_bytes(filled, remaining));
+        assert!(
+            matches!(decoded, Err(Error::Parse(..))),
+            "{filled:?} {remaining:?} decoded as {decoded:?}"
+        );
+    }
+}
+
+fn order_with_filled(filled_quantity: Option<&str>) -> crate::proto::Order {
+    crate::proto::Order {
+        client_id: Some(101),
+        order_id: Some(7),
+        perm_id: Some(700001),
+        action: Some("BUY".into()),
+        total_quantity: Some("10".into()),
+        order_type: Some("LMT".into()),
+        filled_quantity: filled_quantity.map(str::to_owned),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_open_and_completed_orders_keep_the_filled_quantity_cases_apart() {
+    use prost::Message;
+    let open = |filled: Option<&str>| {
+        crate::proto::OpenOrder {
+            order_id: Some(7),
+            order: Some(order_with_filled(filled)),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    };
+    let completed = |filled: Option<&str>| {
+        crate::proto::CompletedOrder {
+            order: Some(order_with_filled(filled)),
+            ..Default::default()
+        }
+        .encode_to_vec()
+    };
+    assert_eq!(super::decode_open_order_proto(&open(None)).unwrap().order.filled_quantity, None);
+    assert_eq!(super::decode_open_order_proto(&open(Some("0"))).unwrap().order.filled_quantity, Some(0.0));
+    assert_eq!(super::decode_open_order_proto(&open(Some("3"))).unwrap().order.filled_quantity, Some(3.0));
+    assert!(matches!(super::decode_open_order_proto(&open(Some("x"))), Err(Error::Parse(..))));
+    assert_eq!(super::decode_completed_order_proto(&completed(None)).unwrap().order.filled_quantity, None);
+    assert_eq!(
+        super::decode_completed_order_proto(&completed(Some("0"))).unwrap().order.filled_quantity,
+        Some(0.0)
+    );
+    assert!(matches!(
+        super::decode_completed_order_proto(&completed(Some("-"))),
+        Err(Error::Parse(..))
+    ));
+}
+
+#[test]
+fn test_a_text_framed_order_status_is_refused_not_decoded() {
+    // The connection floor is PROTOBUF_SCAN_DATA: a text-framed status has no
+    // supported decoding, so its counts are never read as text zeros.
+    let mut message = ResponseMessage::from("3\07\0Submitted\00\010\0");
+    assert!(super::decode_order_status(&mut message).is_err());
 }

@@ -1,6 +1,6 @@
 //! Common message routing logic for sync and async implementations
 
-use crate::messages::{IncomingMessages, ResponseMessage, WARNING_CODE_RANGE};
+use crate::messages::{IncomingMessages, ResponseMessage, MARKET_DATA_NOTICE_CODES, WARNING_CODE_RANGE};
 
 /// Represents how a message should be routed
 #[derive(Debug, Clone, PartialEq)]
@@ -154,9 +154,11 @@ pub(crate) fn order_routing_strategy(message_type: IncomingMessages) -> OrderRou
     }
 }
 
-/// Check if an error code is a warning
+/// Check if an error code bound to a request is a non-terminal notice: a
+/// warning (2100-2169), or market-data information about a subscription that
+/// stays open ([`MARKET_DATA_NOTICE_CODES`]).
 pub(crate) fn is_warning_error(error_code: i32) -> bool {
-    WARNING_CODE_RANGE.contains(&error_code)
+    WARNING_CODE_RANGE.contains(&error_code) || MARKET_DATA_NOTICE_CODES.contains(&error_code)
 }
 
 /// Request ID for unspecified errors

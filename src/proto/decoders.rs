@@ -20,6 +20,69 @@ pub(crate) fn parse_f64(opt: &Option<String>) -> f64 {
     opt.as_deref().and_then(|s| s.parse::<f64>().ok()).unwrap_or_default()
 }
 
+/// A numeric string field that the message must carry.
+///
+/// `parse_f64` answers `0.0` for an absent field and for one that does not
+/// parse, which makes both indistinguishable from a reported zero. For a
+/// position quantity that difference is the whole meaning of the row: a
+/// consumer that sees `0.0` concludes the position is flat. This helper keeps
+/// absence and unparseability as errors so the caller can decide.
+pub(crate) fn required_f64(opt: &Option<String>, field: &str) -> Result<f64, Error> {
+    match opt.as_deref() {
+        None => Err(Error::Parse(0, String::new(), format!("{field} is not present"))),
+        Some(text) => required_text_f64(text, field),
+    }
+}
+
+/// A numeric text field that must carry a number.
+///
+/// The text protocol's `next_double` answers `0.0` for an empty field, which
+/// is right for the many fields IB leaves blank to mean "not applicable" and
+/// wrong for a position quantity, where a blank is not a flat position. This
+/// keeps an empty or unparseable field as an error naming it.
+pub(crate) fn required_text_f64(text: &str, field: &str) -> Result<f64, Error> {
+    if text.is_empty() {
+        return Err(Error::Parse(0, String::new(), format!("{field} is empty")));
+    }
+    text.parse::<f64>()
+        .map_err(|_| Error::Parse(0, text.to_string(), format!("{field} is not a number")))
+}
+
+/// A numeric text field that may be blank.
+///
+/// `None` for an empty field, the number for a numeric one, and an error for
+/// anything else: a blank average cost is a cost IB did not state, and it is
+/// not a cost of zero.
+pub(crate) fn optional_text_f64(text: &str, field: &str) -> Result<Option<f64>, Error> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    required_text_f64(text, field).map(Some)
+}
+
+/// A numeric string field that IB may leave out.
+///
+/// Three cases, kept apart: an absent field (or IB's unset maximum) is
+/// `None`, a stated number is that number, zero included, and anything that
+/// is not a finite number is an error naming the field. `parse_f64` answers
+/// `0.0` for all three, which reads an order IB said nothing about as one
+/// that filled nothing.
+pub(crate) fn optional_decimal_f64(opt: &Option<String>, field: &str) -> Result<Option<f64>, Error> {
+    let Some(text) = opt.as_deref() else {
+        return Ok(None);
+    };
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let value = text
+        .parse::<f64>()
+        .map_err(|_| Error::Parse(0, text.to_string(), format!("{field} is not a number")))?;
+    if !value.is_finite() {
+        return Err(Error::Parse(0, text.to_string(), format!("{field} is not a finite number")));
+    }
+    Ok((value != f64::MAX).then_some(value))
+}
+
 pub(crate) fn parse_i32(opt: &Option<String>) -> i32 {
     opt.as_deref().and_then(|s| s.parse::<i32>().ok()).unwrap_or_default()
 }
@@ -136,7 +199,7 @@ pub fn decode_soft_dollar_tier(proto: &proto::SoftDollarTier) -> SoftDollarTier 
     }
 }
 
-pub fn decode_order(proto: &proto::Order) -> Order {
+pub fn decode_order(proto: &proto::Order) -> Result<Order, Error> {
     let mut order = Order::default();
 
     order.client_id = proto.client_id.unwrap_or_default();
@@ -144,7 +207,10 @@ pub fn decode_order(proto: &proto::Order) -> Order {
     order.perm_id = proto.perm_id.unwrap_or_default();
     order.parent_id = proto.parent_id.unwrap_or_default();
 
-    order.action = Action::from(proto.action.as_deref().unwrap_or("BUY"));
+    // Required, and read fallibly: an order without a side is not an order
+    // this reader can describe, and defaulting it to BUY would report a
+    // working sell as a buy. An unknown side is an error, not a panic.
+    order.action = parse_required::<Action>(proto.action.as_deref(), "Order.action")?;
     order.total_quantity = parse_f64(&proto.total_quantity);
     order.display_size = proto.display_size.map(Some).unwrap_or(Some(0));
     order.order_type = s(&proto.order_type);
@@ -300,7 +366,7 @@ pub fn decode_order(proto: &proto::Order) -> Order {
     order.is_oms_container = proto.is_oms_container.unwrap_or_default();
     order.discretionary_up_to_limit_price = proto.discretionary_up_to_limit_price.unwrap_or_default();
     order.auto_cancel_date = s(&proto.auto_cancel_date);
-    order.filled_quantity = parse_f64(&proto.filled_quantity);
+    order.filled_quantity = optional_decimal_f64(&proto.filled_quantity, "filled_quantity")?;
     order.ref_futures_con_id = proto.ref_futures_con_id.map(Some).unwrap_or(Some(0));
     order.auto_cancel_parent = proto.auto_cancel_parent.unwrap_or_default();
     order.shareholder = s(&proto.shareholder);
@@ -324,7 +390,7 @@ pub fn decode_order(proto: &proto::Order) -> Order {
     order.manual_order_indicator = proto.manual_order_indicator;
     order.submitter = s(&proto.submitter);
 
-    order
+    Ok(order)
 }
 
 fn decode_order_condition(proto: &proto::OrderCondition) -> OrderCondition {

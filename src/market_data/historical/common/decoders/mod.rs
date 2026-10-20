@@ -30,12 +30,13 @@ fn parse_unix_seconds_str(s: &str) -> Result<OffsetDateTime, Error> {
 pub(crate) fn decode_historical_data(server_version: i32, time_zone: &Tz, message: &mut ResponseMessage) -> Result<HistoricalData, Error> {
     message.decode_proto_or_text(
         |bytes| {
-            let bars = decode_historical_data_proto(bytes)?;
-            // start/end come on the separate HistoricalDataEnd message in proto / newer-server flow.
+            let bars = decode_historical_data_proto(bytes, time_zone)?;
+            // start/end come on the separate HistoricalDataEnd message: unknown until it arrives.
             Ok(HistoricalData {
-                start: OffsetDateTime::now_utc(),
-                end: OffsetDateTime::now_utc(),
+                start: None,
+                end: None,
                 bars,
+                notices: Vec::new(),
             })
         },
         |msg| {
@@ -48,11 +49,13 @@ pub(crate) fn decode_historical_data(server_version: i32, time_zone: &Tz, messag
 
             msg.skip(); // request_id
 
-            let mut start = OffsetDateTime::now_utc();
-            let mut end = OffsetDateTime::now_utc();
+            // Older servers state the window in the data message; newer ones in
+            // the separate HistoricalDataEnd, so it stays unknown here.
+            let mut start = None;
+            let mut end = None;
             if message_version > 2 && server_version < server_versions::HISTORICAL_DATA_END {
-                start = parse_date(&msg.next_string()?, time_zone)?;
-                end = parse_date(&msg.next_string()?, time_zone)?;
+                start = Some(parse_date(&msg.next_string()?, time_zone)?);
+                end = Some(parse_date(&msg.next_string()?, time_zone)?);
             }
 
             let mut bars = Vec::new();
@@ -60,22 +63,20 @@ pub(crate) fn decode_historical_data(server_version: i32, time_zone: &Tz, messag
             let bars_count = msg.next_int()?;
             for _ in 0..bars_count {
                 let date = msg.next_string()?;
-                let open = msg.next_double()?;
-                let high = msg.next_double()?;
-                let low = msg.next_double()?;
-                let close = msg.next_double()?;
-                let volume = msg.next_double()?;
-                let wap = msg.next_double()?;
+                let open = next_optional_f64(msg, "open")?;
+                let high = next_optional_f64(msg, "high")?;
+                let low = next_optional_f64(msg, "low")?;
+                let close = next_optional_f64(msg, "close")?;
+                let volume = next_optional_f64(msg, "volume")?;
+                let wap = next_optional_f64(msg, "wap")?;
 
                 if server_version < server_versions::SYNT_REALTIME_BARS {
                     // hasGaps
                     msg.skip();
                 }
 
-                let mut bar_count = -1;
-                if message_version >= 3 {
-                    bar_count = msg.next_int()?;
-                }
+                // Messages older than version 3 carry no count at all.
+                let count = if message_version >= 3 { next_optional_i32(msg, "count")? } else { None };
 
                 bars.push(Bar {
                     date: parse_bar_date(&date, time_zone)?,
@@ -85,11 +86,16 @@ pub(crate) fn decode_historical_data(server_version: i32, time_zone: &Tz, messag
                     close,
                     volume,
                     wap,
-                    count: bar_count,
+                    count,
                 })
             }
 
-            Ok(HistoricalData { start, end, bars })
+            Ok(HistoricalData {
+                start,
+                end,
+                bars,
+                notices: Vec::new(),
+            })
         },
     )
 }
@@ -288,32 +294,35 @@ pub(crate) fn decode_histogram_data(message: &mut ResponseMessage) -> Result<Vec
 /// - wap
 /// - count
 pub(crate) fn decode_historical_data_update(time_zone: &Tz, message: &mut ResponseMessage) -> Result<Bar, Error> {
-    message.decode_proto_or_text(decode_historical_data_update_proto, |msg| {
-        msg.skip(); // message type
-        msg.skip(); // request_id
-        msg.skip(); // bar_count (always -1 for updates)
+    message.decode_proto_or_text(
+        |bytes| decode_historical_data_update_proto(bytes, time_zone),
+        |msg| {
+            msg.skip(); // message type
+            msg.skip(); // request_id
+            msg.skip(); // bar_count (always -1 for updates)
 
-        let date = msg.next_string()?;
-        let open = msg.next_double()?;
-        let high = msg.next_double()?;
-        let low = msg.next_double()?;
-        let close = msg.next_double()?;
-        let volume = msg.next_double()?;
-        let wap = msg.next_double()?;
-        // count field is optional in streaming updates - may not be present
-        let count = msg.next_int().unwrap_or(0);
+            let date = msg.next_string()?;
+            let open = next_optional_f64(msg, "open")?;
+            let high = next_optional_f64(msg, "high")?;
+            let low = next_optional_f64(msg, "low")?;
+            let close = next_optional_f64(msg, "close")?;
+            let volume = next_optional_f64(msg, "volume")?;
+            let wap = next_optional_f64(msg, "wap")?;
+            // The count may be left out of a streaming update entirely: absent, not zero.
+            let count = if msg.i < msg.len() { next_optional_i32(msg, "count")? } else { None };
 
-        Ok(Bar {
-            date: parse_bar_date(&date, time_zone)?,
-            open,
-            high,
-            low,
-            close,
-            volume,
-            wap,
-            count,
-        })
-    })
+            Ok(Bar {
+                date: parse_bar_date(&date, time_zone)?,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                wap,
+                count,
+            })
+        },
+    )
 }
 
 fn parse_time_zone(name: &str) -> Result<&'static Tz, Error> {
@@ -354,6 +363,28 @@ fn parse_date_with_tz(text: &str) -> Result<OffsetDateTime, Error> {
     Ok(dt.assume_timezone(tz).unwrap())
 }
 
+/// A bar value in a text message: `None` for an empty field, the number for a
+/// numeric one, and an error naming the field for anything else. The text
+/// protocol's `next_double` reads an empty field as `0.0`, a price IB never
+/// stated.
+fn next_optional_f64(msg: &mut ResponseMessage, field: &str) -> Result<Option<f64>, Error> {
+    optional_text_f64(&msg.next_string()?, field)
+}
+
+/// A bar count in a text message: `None` for an empty field.
+fn next_optional_i32(msg: &mut ResponseMessage, field: &str) -> Result<Option<i32>, Error> {
+    let text = msg.next_string()?;
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse::<i32>()
+        .map(Some)
+        .map_err(|_| Error::parse_field(text, format!("{field} is not an integer")))
+}
+
+/// A bar's time: `YYYYMMDD` for daily and longer bars (midnight UTC), unix
+/// seconds otherwise (in `time_zone`). Anything else, an empty or absent field
+/// included, is an error: a bar is never given a time IB did not state.
 fn parse_bar_date(text: &str, time_zone: &Tz) -> Result<OffsetDateTime, Error> {
     if text.len() == 8 {
         let date_format = format_description!("[year][month][day]");
@@ -365,7 +396,7 @@ fn parse_bar_date(text: &str, time_zone: &Tz) -> Result<OffsetDateTime, Error> {
         let timestamp: i64 = text
             .parse()
             .map_err(|e: std::num::ParseIntError| Error::parse_field(text, e.to_string()))?;
-        let date_utc = OffsetDateTime::from_unix_timestamp(timestamp).unwrap();
+        let date_utc = OffsetDateTime::from_unix_timestamp(timestamp).map_err(|e| Error::parse_field(text, e.to_string()))?;
         Ok(date_utc.to_timezone(time_zone))
     }
 }
@@ -375,30 +406,31 @@ fn parse_bar_date(text: &str, time_zone: &Tz) -> Result<OffsetDateTime, Error> {
 use prost::Message;
 
 use crate::proto;
-use crate::proto::decoders::{parse_f64 as parse_str_f64, parse_i32 as parse_str_i32, ts};
+use crate::proto::decoders::{optional_decimal_f64, optional_text_f64, parse_i32 as parse_str_i32, ts};
 
-pub(crate) fn decode_historical_data_proto(bytes: &[u8]) -> Result<Vec<Bar>, Error> {
+pub(crate) fn decode_historical_data_proto(bytes: &[u8], time_zone: &Tz) -> Result<Vec<Bar>, Error> {
     let msg = proto::HistoricalData::decode(bytes)?;
-    Ok(msg.historical_data_bars.iter().map(|b| decode_historical_data_bar(b, -1)).collect())
+    msg.historical_data_bars
+        .iter()
+        .map(|b| decode_historical_data_bar(b, time_zone))
+        .collect()
 }
 
-fn decode_historical_data_bar(b: &proto::HistoricalDataBar, default_count: i32) -> Bar {
-    let date = b
-        .date
-        .as_deref()
-        .and_then(|s| s.parse::<i64>().ok())
-        .and_then(|t| OffsetDateTime::from_unix_timestamp(t).ok())
-        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
-    Bar {
-        date,
-        open: b.open.unwrap_or_default(),
-        high: b.high.unwrap_or_default(),
-        low: b.low.unwrap_or_default(),
-        close: b.close.unwrap_or_default(),
-        volume: parse_str_f64(&b.volume),
-        wap: parse_str_f64(&b.wap),
-        count: b.bar_count.unwrap_or(default_count),
-    }
+/// One protobuf bar. Absent fields stay `None`; an absent or unreadable time is
+/// an error, never `UNIX_EPOCH`. The time goes through the text path's
+/// [`parse_bar_date`], so a daily bar's `YYYYMMDD` reads the same on both.
+fn decode_historical_data_bar(b: &proto::HistoricalDataBar, time_zone: &Tz) -> Result<Bar, Error> {
+    let date = b.date.as_deref().ok_or_else(|| Error::parse_proto("date", "bar time is not present"))?;
+    Ok(Bar {
+        date: parse_bar_date(date, time_zone)?,
+        open: b.open,
+        high: b.high,
+        low: b.low,
+        close: b.close,
+        volume: optional_decimal_f64(&b.volume, "volume")?,
+        wap: optional_decimal_f64(&b.wap, "wap")?,
+        count: b.bar_count,
+    })
 }
 
 pub(crate) fn decode_head_timestamp_proto(bytes: &[u8]) -> Result<String, Error> {
@@ -515,9 +547,12 @@ pub(crate) fn decode_historical_schedule_proto(bytes: &[u8]) -> Result<Schedule,
     })
 }
 
-pub(crate) fn decode_historical_data_update_proto(bytes: &[u8]) -> Result<Bar, Error> {
+pub(crate) fn decode_historical_data_update_proto(bytes: &[u8], time_zone: &Tz) -> Result<Bar, Error> {
     let p = proto::HistoricalDataUpdate::decode(bytes)?;
-    Ok(decode_historical_data_bar(&p.historical_data_bar.unwrap_or_default(), 0))
+    let bar = p
+        .historical_data_bar
+        .ok_or_else(|| Error::parse_proto("historical_data_bar", "missing in HistoricalDataUpdate"))?;
+    decode_historical_data_bar(&bar, time_zone)
 }
 
 #[cfg(test)]

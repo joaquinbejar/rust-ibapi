@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 
 use crate::client::builders::client_builder::async_impl::ClientBuilder;
 use crate::connection::common::StartupMessage;
-use crate::connection::{r#async::AsyncConnection, ConnectionMetadata};
+use crate::connection::{r#async::AsyncConnection, split_accounts, ConnectionMetadata};
 use crate::messages::{Notice, OutgoingMessages};
 use crate::transport::{
     r#async::{AsyncInternalSubscription, AsyncTcpMessageBus},
@@ -32,6 +32,8 @@ pub struct Client {
 
     client_id: i32,                   // ID of client.
     id_manager: Arc<ClientIdManager>, // Manages request and order ID generation
+    /// The accounts the Gateway listed during the handshake, in its order.
+    handshake_managed_accounts: Vec<String>,
 }
 
 impl Drop for Client {
@@ -106,11 +108,16 @@ impl Client {
         tcp_no_delay: bool,
         startup_callback: Option<Arc<dyn Fn(StartupMessage) + Send + Sync>>,
         notice_sender: broadcast::Sender<Notice>,
+        auto_reconnect: bool,
+        write_gate: Option<Arc<dyn crate::transport::write_gate::WriteGate>>,
     ) -> Result<Client, Error> {
-        let connection = AsyncConnection::with_pieces(address, client_id, tcp_no_delay, startup_callback, notice_sender).await?;
+        let connection = AsyncConnection::with_pieces(address, client_id, tcp_no_delay, startup_callback, notice_sender, write_gate).await?;
         let connection_metadata = connection.connection_metadata().await;
 
         let message_bus = Arc::new(AsyncTcpMessageBus::new(connection)?);
+        if !auto_reconnect {
+            message_bus.disable_auto_reconnect();
+        }
 
         // Start background task to read messages from TWS
         message_bus
@@ -128,9 +135,19 @@ impl Client {
             message_bus,
             client_id: connection_metadata.client_id,
             id_manager: Arc::new(ClientIdManager::new(connection_metadata.next_order_id)),
+            handshake_managed_accounts: split_accounts(&connection_metadata.managed_accounts),
         };
 
         Ok(client)
+    }
+
+    /// The accounts the Gateway listed in its handshake, in the order it
+    /// listed them: what this session was accepted for.
+    ///
+    /// Taken once, from the handshake's own `managedAccounts` message, and not
+    /// refreshed. For the current list, ask the Gateway.
+    pub fn handshake_managed_accounts(&self) -> &[String] {
+        &self.handshake_managed_accounts
     }
 
     /// Returns the server version

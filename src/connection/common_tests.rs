@@ -775,7 +775,7 @@ fn test_dispatch_unsolicited_commission_report_typed() {
 
     dispatch_unsolicited_message(TEST_SERVER_VERSION, &mut message, &startup_ctx(&cb));
     let got = captured_clone.lock().unwrap().take().expect("callback didn't fire");
-    assert_eq!(got.commission, 2.5);
+    assert_eq!(got.commission, Some(2.5));
     assert_eq!(got.currency, "USD");
 }
 

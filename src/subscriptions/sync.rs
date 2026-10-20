@@ -22,7 +22,8 @@ use crate::transport::{InternalSubscription, MessageBus};
 /// * `None` — the stream has ended.
 /// * `Some(Ok(SubscriptionItem::Data(t)))` — a decoded value.
 /// * `Some(Ok(SubscriptionItem::Notice(n)))` — a non-fatal IB notice (warning code
-///   2100..=2169 or order-cancel code 202) carried on this subscription's
+///   2100..=2169, market-data information 10167 or 10090, or order-cancel code
+///   202) carried on this subscription's
 ///   `request_id`; the stream stays open.
 /// * `Some(Err(e))` — terminal error; subsequent calls return `None`.
 ///
@@ -43,6 +44,9 @@ pub struct Subscription<T: StreamDecoder<T>> {
     message_type: Option<OutgoingMessages>,
     phantom: PhantomData<T>,
     cancelled: AtomicBool,
+    /// Whether a cancel request was written to the session: only this proves
+    /// it went out (see `try_cancel`).
+    cancel_sent: AtomicBool,
     snapshot_ended: AtomicBool,
     stream_ended: AtomicBool,
     subscription: InternalSubscription,
@@ -69,48 +73,61 @@ impl<T: StreamDecoder<T>> Subscription<T> {
             subscription,
             phantom: PhantomData,
             cancelled: AtomicBool::new(false),
+            cancel_sent: AtomicBool::new(false),
             snapshot_ended: AtomicBool::new(false),
             stream_ended: AtomicBool::new(false),
         }
     }
 
-    /// Cancel the subscription
+    /// Cancel the subscription.
+    ///
+    /// Best effort: a cancel request that cannot be written is logged, and the
+    /// subscription is closed locally anyway. Use [`try_cancel`](Self::try_cancel)
+    /// to know whether a cancel request went out.
     pub fn cancel(&self) {
-        // Skip on snapshot subscriptions whose data already arrived.
-        if self.snapshot_ended.load(Ordering::Relaxed) {
+        if self.snapshot_ended.load(Ordering::Relaxed) || self.cancelled.load(Ordering::Relaxed) {
             return;
         }
-
-        if self.cancelled.load(Ordering::Relaxed) {
-            return;
+        if let Err(e) = self.try_cancel() {
+            warn!("error cancelling subscription: {e}");
+            self.cancelled.store(true, Ordering::Relaxed);
+            self.subscription.cancel();
         }
+    }
 
-        self.cancelled.store(true, Ordering::Relaxed);
-
+    /// Cancel the subscription, and say whether a cancel request was written to
+    /// the session.
+    ///
+    /// IB acknowledges no cancellation of a market-data or streaming request,
+    /// so the written request is the last point a caller can confirm. Returns
+    /// `Ok(())` when a cancel request was written, by this call or an earlier
+    /// one, or when the resource itself ended (a snapshot whose data arrived);
+    /// a subscription closed locally by a best-effort [`cancel`](Self::cancel)
+    /// whose write failed is **not** a sent cancel, and this writes it. On a
+    /// write error nothing is recorded as sent, so a later call tries again.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] when this subscription has no way to address
+    /// a cancel request; otherwise the error of encoding or writing it.
+    pub fn try_cancel(&self) -> Result<(), Error> {
+        if self.cancel_sent.load(Ordering::Relaxed) || self.snapshot_ended.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if self.request_id.is_none() && self.order_id.is_none() && self.message_type.is_none() {
+            return Err(Error::InvalidArgument("this subscription has no cancel request to send".to_owned()));
+        }
+        let message = T::cancel_message(self.context.server_version, self.request_id, Some(&self.context))?;
         if let Some(request_id) = self.request_id {
-            if let Ok(message) = T::cancel_message(self.context.server_version, self.request_id, Some(&self.context)) {
-                if let Err(e) = self.message_bus.cancel_subscription(request_id, &message) {
-                    warn!("error cancelling subscription: {e}")
-                }
-                self.subscription.cancel();
-            }
+            self.message_bus.cancel_subscription(request_id, &message)?;
         } else if let Some(order_id) = self.order_id {
-            if let Ok(message) = T::cancel_message(self.context.server_version, self.request_id, Some(&self.context)) {
-                if let Err(e) = self.message_bus.cancel_order_subscription(order_id, &message) {
-                    warn!("error cancelling order subscription: {e}")
-                }
-                self.subscription.cancel();
-            }
+            self.message_bus.cancel_order_subscription(order_id, &message)?;
         } else if let Some(message_type) = self.message_type {
-            if let Ok(message) = T::cancel_message(self.context.server_version, self.request_id, Some(&self.context)) {
-                if let Err(e) = self.message_bus.cancel_shared_subscription(message_type, &message) {
-                    warn!("error cancelling shared subscription: {e}")
-                }
-                self.subscription.cancel();
-            }
-        } else {
-            debug!("Could not determine cancel method")
+            self.message_bus.cancel_shared_subscription(message_type, &message)?;
         }
+        self.cancel_sent.store(true, Ordering::Relaxed);
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.subscription.cancel();
+        Ok(())
     }
 
     /// Returns the request ID associated with this subscription.

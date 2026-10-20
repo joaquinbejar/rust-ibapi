@@ -24,8 +24,26 @@ pub(in crate::accounts) fn encode_request_account_summary(request_id: i32, group
     ))
 }
 
-pub(in crate::accounts) fn encode_cancel_account_summary(request_id: i32) -> Result<Vec<u8>, Error> {
-    crate::proto::encoders::encode_cancel_by_id!(request_id, CancelAccountSummary, OutgoingMessages::CancelAccountSummary)
+/// The cancel of account summary `request_id`, as `server_version` needs it
+/// ([`crate::accounts::AccountSummaryCancelCodec`]).
+pub(in crate::accounts) fn encode_cancel_account_summary(server_version: i32, request_id: i32) -> Result<Vec<u8>, Error> {
+    match crate::accounts::AccountSummaryCancelCodec::for_server_version(server_version) {
+        crate::accounts::AccountSummaryCancelCodec::Protobuf => {
+            crate::proto::encoders::encode_cancel_by_id!(request_id, CancelAccountSummary, OutgoingMessages::CancelAccountSummary)
+        }
+        crate::accounts::AccountSummaryCancelCodec::Legacy => Ok(encode_legacy_cancel_account_summary(request_id)),
+    }
+}
+
+/// The legacy cancel: the binary message id 63, then the text fields
+/// `VERSION` (1) and the request id, each NUL-terminated, as IB's own client
+/// writes it for a server that reads binary message ids.
+fn encode_legacy_cancel_account_summary(request_id: i32) -> Vec<u8> {
+    let fields = format!("1\0{request_id}\0");
+    let mut body = Vec::with_capacity(4 + fields.len());
+    body.extend_from_slice(&(OutgoingMessages::CancelAccountSummary as i32).to_be_bytes());
+    body.extend_from_slice(fields.as_bytes());
+    body
 }
 
 pub(in crate::accounts) fn encode_request_pnl(request_id: i32, account: &AccountId, model_code: Option<&ModelCode>) -> Result<Vec<u8>, Error> {
@@ -189,8 +207,36 @@ mod tests {
 
     #[test]
     fn test_encode_cancel_account_summary() {
-        let bytes = super::encode_cancel_account_summary(3000).unwrap();
+        let bytes = super::encode_cancel_account_summary(crate::server_versions::PROTOBUF_ACCOUNTS_POSITIONS, 3000).unwrap();
         assert_proto_msg_id(&bytes, OutgoingMessages::CancelAccountSummary);
+    }
+
+    // Gateway 10.45.1j, server 221: the legacy cancel, byte for byte.
+    #[test]
+    fn test_encode_cancel_account_summary_legacy_on_server_221() {
+        let bytes = super::encode_cancel_account_summary(221, 60002).unwrap();
+        assert_eq!(bytes, b"\x00\x00\x00\x3f1\x0060002\x00".to_vec());
+    }
+
+    // Only the observed version: its neighbours keep the protobuf cancel.
+    #[test]
+    fn test_encode_cancel_account_summary_protobuf_beside_221() {
+        use prost::Message;
+        for server_version in [220, 222] {
+            let bytes = super::encode_cancel_account_summary(server_version, 60002).unwrap();
+            assert_eq!(&bytes[..4], &263i32.to_be_bytes(), "server {server_version}");
+            let cancel = crate::proto::CancelAccountSummary::decode(&bytes[4..]).unwrap();
+            assert_eq!(cancel.req_id, Some(60002));
+        }
+    }
+
+    #[test]
+    fn test_the_cancel_codec_names_its_wire_id() {
+        use crate::accounts::AccountSummaryCancelCodec;
+        assert_eq!(AccountSummaryCancelCodec::for_server_version(221), AccountSummaryCancelCodec::Legacy);
+        assert_eq!(AccountSummaryCancelCodec::for_server_version(220), AccountSummaryCancelCodec::Protobuf);
+        assert_eq!(AccountSummaryCancelCodec::Legacy.wire_message_id(), 63);
+        assert_eq!(AccountSummaryCancelCodec::Protobuf.wire_message_id(), 263);
     }
 
     #[test]

@@ -196,6 +196,10 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::sync::Client> {
 impl<'a> HistoricalDataBuilder<'a, crate::client::r#async::Client> {
     /// Submit a one-shot request and return the [`HistoricalData`] bars.
     ///
+    /// One request, never retried, with no timeout of its own; its answer is
+    /// complete only on IB's end marker. Use [`send`](Self::send) to know the
+    /// request id, bound the wait, or cancel the request.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -226,6 +230,40 @@ impl<'a> HistoricalDataBuilder<'a, crate::client::r#async::Client> {
     /// }
     /// ```
     pub async fn fetch(self) -> Result<HistoricalData, Error> {
+        self.send().await?.answer().await
+    }
+
+    /// Send a one-shot request and return its
+    /// [`HistoricalDataRequest`](crate::market_data::historical::HistoricalDataRequest):
+    /// IB's request id, the answer (optionally within a timeout), and the
+    /// cancellation.
+    ///
+    /// The request has been written when this returns.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::Duration as StdDuration;
+    /// use ibapi::prelude::*;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), ibapi::Error> {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await?;
+    ///     let contract = Contract::stock("AAPL").build();
+    ///
+    ///     let mut request = client
+    ///         .historical_data(&contract, HistoricalBarSize::Min)
+    ///         .duration(1.days())
+    ///         .send()
+    ///         .await?;
+    ///     println!("sent as request {}", request.request_id());
+    ///
+    ///     let data = request.answer_within(StdDuration::from_secs(30)).await?;
+    ///     println!("{} bars", data.bars.len());
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn send(self) -> Result<crate::market_data::historical::HistoricalDataRequest, Error> {
         let (end_date, duration) = self.resolve_date_spec()?;
         crate::market_data::historical::r#async::historical_data(
             self.client,

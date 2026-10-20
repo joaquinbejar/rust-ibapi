@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(update) => match update {
                 PositionUpdate::Position(position) => {
                     println!(
-                        "Position: {} {} @ {} (avg cost: {}) in account {}",
+                        "Position: {} {} @ {} (avg cost: {:?}) in account {}",
                         position.position, position.contract.symbol, position.contract.exchange, position.average_cost, position.account
                     );
                 }

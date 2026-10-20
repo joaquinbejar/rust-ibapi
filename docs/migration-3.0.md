@@ -697,6 +697,64 @@ let book = client.market_depth(&contract, 5)
 
 `SmartDepth::No` is the default — callers that previously passed `false` can omit `.smart_depth(...)` entirely.
 
+### 30. Historical data: absent values, IB's own window, one request per call
+
+An answer to a historical bar request now carries only what IB stated, and a one-shot request is exactly one request, which a caller can identify, bound in time and cancel.
+
+**Bar values are `Option`.** `Bar.open`, `.high`, `.low`, `.close`, `.volume` and `.wap` are `Option<f64>`, and `Bar.count` is `Option<i32>`. On both wire encodings, a value IB left out is `None`; it used to be `0.0` (`-1` or `0` for `count`). Values IB states are kept as stated, zero and IB's own `-1` included. A bar whose time is absent or unreadable is a decode error; it used to be `UNIX_EPOCH`.
+
+```rust,ignore
+// v3 before
+let close: f64 = bar.close;
+
+// v3 now
+if let Some(close) = bar.close { /* IB stated it */ }
+```
+
+**The window is IB's or `None`.** `HistoricalData.start` and `.end` are `Option<OffsetDateTime>`. They are set only from IB's `HistoricalDataEnd` message (or, on servers older than `HISTORICAL_DATA_END`, from the data message itself). Before that they were `OffsetDateTime::now_utc()` placeholders. The streaming variant's initial `Historical` batch has `None` until its `End` arrives.
+
+**The end marker is required.** `.fetch()` returns `Ok` only after `HistoricalDataEnd`. A channel that closes or resets before it is the new `Error::Interrupted(request_id)`, never the bars received so far.
+
+**No hidden retry.** `historical_data(..).fetch()`, `head_timestamp`, `histogram_data` and `historical_schedules(..).fetch()` each send one request, on both clients. Before, the async one-shot request resent up to 5 times under new ids (the crate-private `MAX_RETRIES`, now removed), and `head_timestamp` recursed without bound. A closed channel or a `ConnectionReset` now ends the call as `Error::Interrupted(request_id)`. It used to be `ConnectionReset`, `UnexpectedEndOfStream`, or an empty histogram. Retry, if you want one, is yours: a new call is a new request.
+
+**IB's codes are kept.** `HistoricalData` has a new field, `notices: Vec<Notice>`: the informational codes IB sent for the request, in order, with their text. The 2100-2169 warnings and [`HISTORICAL_DATA_NOTICE_CODES`](https://docs.rs/ibapi/latest/ibapi/market_data/historical/constant.HISTORICAL_DATA_NOTICE_CODES.html) (2174, "date-time without an explicit time zone") no longer end a one-shot request; before, 2174 ended it although IB kept serving it. Any other code still ends it as `Error::Notice`, with IB's code and text. A struct literal of `HistoricalData` needs the new field. The streaming variant is unchanged and yields notices as `SubscriptionItem::Notice`.
+
+**Request id, timeout and cancel (async).** `.send()` writes the request and returns a [`HistoricalDataRequest`](https://docs.rs/ibapi/latest/ibapi/market_data/historical/struct.HistoricalDataRequest.html). `.fetch()` is `.send()` followed by `.answer()`.
+
+```rust,ignore
+use std::time::Duration as StdDuration;
+
+let mut request = client
+    .historical_data(&contract, HistoricalBarSize::Min)
+    .duration(1.days())
+    .send()
+    .await?;
+let request_id = request.request_id(); // the id IB uses for every answer, error and notice
+
+match request.answer_within(StdDuration::from_secs(30)).await {
+    Ok(data) => println!("{} bars, window {:?} to {:?}, notices {:?}", data.bars.len(), data.start, data.end, data.notices),
+    Err(Error::TimedOut(_)) => {
+        // The request is still open at IB: end it there. Ok only once the
+        // cancelHistoricalData was written.
+        request.cancel().await?;
+    }
+    Err(e) => eprintln!("request {request_id} failed: {e}; codes so far: {:?}", request.notices()),
+}
+```
+
+- `answer()` is cancel-safe: you can wrap it in your own timer without losing what arrived, and a later call returns the same result.
+- `answer_within(timeout)` returns `Error::TimedOut(request_id)` and leaves the request open. It never cancels on its own.
+- `cancel()` writes `cancelHistoricalData` and says whether the write succeeded. If the write fails, the request stays open and a later call tries again.
+- `is_open()` is true while the request may still be live at IB. That includes after a local error ended the answer (a lagged channel, an undecodable or unexpected message): `cancel()` then writes the cancel, and dropping the handle sends it.
+- `cancel()` writes nothing, and dropping writes nothing, once IB ended the request or its session is gone. IB has ended it once its end marker or a code that ends the request has arrived. The session is gone after `Interrupted` (channel closed or connection reset), because IB drops a session's requests with the session.
+- `notices()` lists every code IB sent for the request, in order, including the one that ended it.
+
+The sync client keeps `.fetch()` only: one request, end marker required, notices kept.
+
+**Option computations.** `OptionComputation` has a new field, `raw: OptionComputationRaw`, which holds what IB sent: the tick type as its number (an unknown one included) and every value with its sentinels. A typed value is `None` in three cases: IB left it out, sent `f64::MAX`, or sent its "not computed" sentinel. The sentinel is `-1` for the implied volatility and the prices, and `-2` for the greeks (`OPTION_PRICE_NOT_COMPUTED`, `OPTION_GREEK_NOT_COMPUTED`). On the protobuf path, `-1` and `-2` used to decode as `Some`. An absent protobuf tick type is a decode error; it used to be type 0. On the text path, an empty value is `None`; it used to be `0.0`. A struct literal needs the new field; `..Default::default()` still works.
+
+**`Error` gains `Interrupted(i32)` and `TimedOut(i32)`**, both carrying IB's request id. `Error` is `#[non_exhaustive]`, so matches already have a wildcard arm.
+
 ## Before / after: common subscription patterns
 
 ### Order construction
@@ -1046,7 +1104,8 @@ Distinct from `Error::ConnectionRejected` (handshake-time refusal, above) and th
 5. Replace string compares against `OrderStatus.status` / `OrderState.status` (`== "Filled"`, `.as_str() == "Cancelled"`, etc.) with `OrderStatusKind` variants or the `is_active()` / `is_terminal()` helpers.
 6. Replace `Client::connect_with_callback` / `Client::connect_with_options` / any `ConnectionOptions::default()...` with the corresponding `Client::builder()` chain. Use `connect_with_notice_stream()` if you previously installed `startup_notice_callback`.
 7. (Optional) Adopt `Client::notice_stream()` for runtime-only unrouted notice observability.
-8. Re-run `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and your test suite for each feature flag you support.
+8. Historical data: read `Bar` values and `HistoricalData.start` / `.end` as `Option`, handle `Error::Interrupted` instead of `ConnectionReset` / `UnexpectedEndOfStream` from one-shot requests, and use `.send()` for a request id, a timeout or a cancel (see section 30).
+9. Re-run `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and your test suite for each feature flag you support.
 
 ## Need help?
 

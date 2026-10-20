@@ -397,6 +397,126 @@ mod tick_price_tests {
     }
 }
 
+mod tick_presence_and_text_tests {
+    //! What ib-engine needs from a tick beyond its `f64`s: whether the message
+    //! carried a price at all, and a size's text exactly as IB sent it.
+    use super::*;
+
+    fn price_tick(price: Option<f64>, size: Option<&str>) -> Vec<u8> {
+        crate::proto::TickPrice {
+            req_id: Some(9000),
+            tick_type: Some(1),
+            price,
+            size: size.map(str::to_owned),
+            attr_mask: None,
+        }
+        .encode_to_vec()
+    }
+
+    #[test]
+    fn a_message_without_a_price_says_so_rather_than_reporting_zero() {
+        match decode_tick_price_proto(&price_tick(None, Some("0"))).expect("decode failed") {
+            TickTypes::PriceSize(ps) => {
+                assert!(!ps.price_present);
+                assert_eq!(ps.price, 0.0, "the f64 still defaults");
+                assert_eq!(ps.size_text.as_deref(), Some("0"));
+            }
+            other => panic!("expected PriceSize, got {other:?}"),
+        }
+        match decode_tick_price_proto(&price_tick(None, None)).expect("decode failed") {
+            TickTypes::Price(tp) => assert!(!tp.price_present),
+            other => panic!("expected Price, got {other:?}"),
+        }
+        match decode_tick_price_proto(&price_tick(Some(0.0), Some("7"))).expect("decode failed") {
+            TickTypes::PriceSize(ps) => {
+                assert!(ps.price_present, "a zero price that was sent is present");
+                assert_eq!(ps.size_text.as_deref(), Some("7"));
+            }
+            other => panic!("expected PriceSize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_size_keeps_its_text_exactly_as_sent() {
+        let text = "123.456789012345678901";
+        match decode_tick_price_proto(&price_tick(Some(1.5), Some(text))).expect("decode failed") {
+            TickTypes::PriceSize(ps) => assert_eq!(ps.size_text.as_deref(), Some(text)),
+            other => panic!("expected PriceSize, got {other:?}"),
+        }
+        let size_tick = crate::proto::TickSize {
+            req_id: Some(9000),
+            tick_type: Some(0),
+            size: Some("0.30000000000000004".to_owned()),
+        }
+        .encode_to_vec();
+        let decoded = decode_tick_size_proto(&size_tick).expect("decode failed");
+        assert_eq!(decoded.size_text.as_deref(), Some("0.30000000000000004"));
+    }
+
+    #[test]
+    fn a_size_that_is_not_a_number_is_kept_as_text_not_dropped() {
+        // The reviewer's case (ACS 1215, 1218): "not-a-size" became None, and a
+        // price tick carrying it fell back to a plain price, losing the fact
+        // that IB sent a size at all.
+        match decode_tick_price_proto(&price_tick(Some(1.5), Some("not-a-size"))).expect("decode failed") {
+            TickTypes::PriceSize(ps) => {
+                assert_eq!(ps.size_text.as_deref(), Some("not-a-size"));
+                assert!(ps.size.is_nan(), "never a plausible number");
+            }
+            other => panic!("expected PriceSize, got {other:?}"),
+        }
+        let size_tick = crate::proto::TickSize {
+            req_id: Some(9000),
+            tick_type: Some(0),
+            size: Some("not-a-size".to_owned()),
+        }
+        .encode_to_vec();
+        let decoded = decode_tick_size_proto(&size_tick).expect("decode failed");
+        assert_eq!(decoded.size_text.as_deref(), Some("not-a-size"));
+        assert!(decoded.size.is_nan());
+    }
+
+    #[test]
+    fn an_empty_size_is_no_size() {
+        match decode_tick_price_proto(&price_tick(Some(1.5), Some(""))).expect("decode failed") {
+            TickTypes::Price(tp) => assert!(tp.price_present),
+            other => panic!("expected Price, got {other:?}"),
+        }
+        let size_tick = crate::proto::TickSize {
+            req_id: Some(9000),
+            tick_type: Some(0),
+            size: Some(String::new()),
+        }
+        .encode_to_vec();
+        let decoded = decode_tick_size_proto(&size_tick).expect("decode failed");
+        assert_eq!(decoded.size_text, None);
+        assert_eq!(decoded.size, 0.0);
+    }
+
+    #[test]
+    fn an_unset_size_has_no_text() {
+        let unset = f64::MAX.to_string();
+        match decode_tick_price_proto(&price_tick(Some(1.5), Some(&unset))).expect("decode failed") {
+            TickTypes::Price(tp) => assert!(tp.price_present, "no size companion when the size is unset"),
+            other => panic!("expected Price, got {other:?}"),
+        }
+        let size_tick = crate::proto::TickSize {
+            req_id: Some(9000),
+            tick_type: Some(0),
+            size: Some(unset),
+        }
+        .encode_to_vec();
+        assert_eq!(decode_tick_size_proto(&size_tick).expect("decode failed").size_text, None);
+        let empty = crate::proto::TickSize {
+            req_id: Some(9000),
+            tick_type: Some(0),
+            size: None,
+        }
+        .encode_to_vec();
+        assert_eq!(decode_tick_size_proto(&empty).expect("decode failed").size_text, None);
+    }
+}
+
 mod tick_size_tests {
     use super::*;
 
@@ -535,6 +655,104 @@ mod tick_option_computation_tests {
         };
         let result = decode_tick_option_computation_proto(&proto_msg.encode_to_vec()).expect("decode failed");
         assert_eq!(result.implied_volatility, None);
+        assert_eq!(result.raw.implied_volatility, Some(f64::MAX), "the unset maximum is kept raw");
+    }
+
+    // === D14 item 6 ===
+
+    fn decode(proto_msg: crate::proto::TickOptionComputation) -> Result<crate::contracts::OptionComputation, Error> {
+        // Through the production dispatch, as the market-data stream decodes it.
+        let mut message = ResponseMessage::from_protobuf(
+            crate::messages::IncomingMessages::TickOptionComputation as i32,
+            proto_msg.encode_to_vec(),
+            crate::server_versions::PROTOBUF_MARKET_DATA,
+        );
+        decode_tick_option_computation(&mut message)
+    }
+
+    #[test]
+    fn test_option_computation_proto_not_computed_sentinels_are_absent_and_kept_raw() {
+        // This decoded -1 and -2 as values: an implied volatility of -1.
+        let result = decode(crate::proto::TickOptionComputation {
+            req_id: Some(1),
+            tick_type: Some(13),
+            implied_vol: Some(-1.0),
+            delta: Some(-2.0),
+            opt_price: Some(-1.0),
+            pv_dividend: Some(-1.0),
+            gamma: Some(-2.0),
+            vega: Some(-2.0),
+            theta: Some(-2.0),
+            und_price: Some(-1.0),
+            ..Default::default()
+        })
+        .expect("decodes");
+
+        assert_eq!(
+            (
+                result.implied_volatility,
+                result.delta,
+                result.option_price,
+                result.present_value_dividend,
+                result.gamma,
+                result.vega,
+                result.theta,
+                result.underlying_price
+            ),
+            (None, None, None, None, None, None, None, None)
+        );
+        let raw = result.raw;
+        assert_eq!(
+            (raw.implied_volatility, raw.delta, raw.option_price, raw.gamma, raw.underlying_price),
+            (Some(-1.0), Some(-2.0), Some(-1.0), Some(-2.0), Some(-1.0)),
+            "each sentinel recorded as IB sent it"
+        );
+    }
+
+    #[test]
+    fn test_option_computation_proto_sentinels_are_per_field() {
+        // Negative control: -1 is not a greek's sentinel and -2 is not a
+        // price's, so a theta of -1 and a delta of -0.5 are values.
+        let result = decode(crate::proto::TickOptionComputation {
+            req_id: Some(1),
+            tick_type: Some(13),
+            implied_vol: Some(0.0),
+            delta: Some(-0.5),
+            theta: Some(-1.0),
+            und_price: Some(-2.0),
+            ..Default::default()
+        })
+        .expect("decodes");
+
+        assert_eq!(result.implied_volatility, Some(0.0));
+        assert_eq!(result.delta, Some(-0.5));
+        assert_eq!(result.theta, Some(-1.0));
+        assert_eq!(result.underlying_price, Some(-2.0));
+        assert_eq!(result.gamma, None, "absent");
+        assert_eq!(result.raw.gamma, None, "absent raw too: not sent");
+    }
+
+    #[test]
+    fn test_option_computation_proto_without_tick_type_is_an_error() {
+        // This decoded as tick type 0, BidSize.
+        let result = decode(crate::proto::TickOptionComputation {
+            req_id: Some(1),
+            implied_vol: Some(0.25),
+            ..Default::default()
+        });
+        assert!(matches!(result, Err(Error::Parse(..))), "got {result:?}");
+    }
+
+    #[test]
+    fn test_option_computation_proto_keeps_the_tick_type_number() {
+        let result = decode(crate::proto::TickOptionComputation {
+            req_id: Some(1),
+            tick_type: Some(999),
+            ..Default::default()
+        })
+        .expect("decodes");
+        assert_eq!(result.field, TickType::Unknown);
+        assert_eq!(result.raw.tick_type, 999, "an unknown tick type keeps its number");
     }
 }
 

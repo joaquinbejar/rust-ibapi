@@ -14,6 +14,7 @@ use log::{debug, error, info, warn};
 use tokio::sync::{broadcast, mpsc, Notify, RwLock};
 use tokio::task;
 use tokio::time::Duration;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::connection::r#async::AsyncConnection;
@@ -26,6 +27,10 @@ use super::routing::{
 };
 use super::RoutedItem;
 
+/// How long `ensure_shutdown` waits for the dispatcher task once the socket is
+/// closed. The close ends its read at once; this bounds anything else.
+const DISPATCHER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Default capacity for broadcast channels
 /// This should be large enough to handle bursts of messages without lagging
 pub(crate) const BROADCAST_CHANNEL_CAPACITY: usize = 1024;
@@ -33,10 +38,174 @@ pub(crate) const BROADCAST_CHANNEL_CAPACITY: usize = 1024;
 /// Cleanup signal for removing channels when subscriptions are dropped
 #[derive(Debug, Clone)]
 pub enum CleanupSignal {
-    Request(i32),
-    Order(i32),
+    Request(i32, ChannelIdentity),
+    Order(i32, ChannelIdentity),
     Shared(OutgoingMessages),
     OrderUpdateStream,
+    /// A registration whose request was never handed back as a subscription:
+    /// its write failed or its future was dropped. See [`Registration`].
+    Withdraw(Withdrawal),
+}
+
+/// Which table a [`Registration`] is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Table {
+    Request,
+    Order,
+}
+
+/// Which channel an entry in a table is: a subscription's cleanup and a
+/// withdrawal act on an entry only if it is still theirs, never on a
+/// successor registered under the same id since.
+pub type ChannelIdentity = broadcast::WeakSender<RoutedItem>;
+
+fn is_entry(channels: &HashMap<i32, BroadcastSender>, id: i32, ours: &ChannelIdentity) -> bool {
+    match (channels.get(&id), ours.upgrade()) {
+        (Some(current), Some(ours)) => current.same_channel(&ours),
+        _ => false,
+    }
+}
+
+/// A subscription has ended: remove its entry if the entry is still its
+/// channel and nothing listens on that channel any more. Another subscription
+/// may share the channel (a clone, or a modify that joined an order's
+/// channel), and a successor may have replaced it; both are left alone.
+fn release(channels: &mut HashMap<i32, BroadcastSender>, id: i32, ours: &ChannelIdentity) {
+    if is_entry(channels, id, ours) && channels.get(&id).is_some_and(|current| current.receiver_count() == 0) {
+        channels.remove(&id);
+    }
+}
+
+/// What undoing a [`Registration`] needs: whose entry it was, and what it
+/// replaced.
+#[derive(Debug, Clone)]
+pub struct Withdrawal {
+    table: Table,
+    id: i32,
+    ours: ChannelIdentity,
+    previous: Option<BroadcastSender>,
+}
+
+impl Withdrawal {
+    /// Undo the registration in `channels`, once its own receiver is gone.
+    ///
+    /// Only an entry that is still ours and that nobody else listens on is
+    /// touched: a successor, a table cleared by a reconnect or a shutdown, and
+    /// a channel another subscription shares are left alone. An entry it
+    /// replaced is put back if anything still listens on it.
+    fn apply(self, channels: &mut HashMap<i32, BroadcastSender>) {
+        if !is_entry(channels, self.id, &self.ours) || channels.get(&self.id).is_some_and(|current| current.receiver_count() > 0) {
+            return;
+        }
+        match self.previous {
+            Some(previous) if previous.receiver_count() > 0 => {
+                channels.insert(self.id, previous);
+            }
+            _ => {
+                channels.remove(&self.id);
+            }
+        }
+    }
+}
+
+/// A response channel registered under a request or order id before its
+/// request is written, so that no answer arrives before it can be routed.
+///
+/// Until [`Registration::keep`], the request has not been handed back as a
+/// subscription, and nothing else will ever release the entry: a write that
+/// fails (a gate's refusal, a closed connection) or a future dropped while it
+/// waits must undo it. [`Registration::withdraw`] does so on the error path;
+/// dropping an armed registration hands the same withdrawal to the bus's
+/// cleanup task, which is what a cancelled future does. Either way the
+/// registration's own receiver goes first.
+struct Registration<'a> {
+    channels: &'a RwLock<HashMap<i32, BroadcastSender>>,
+    cleanup: &'a mpsc::UnboundedSender<CleanupSignal>,
+    receiver: Option<broadcast::Receiver<RoutedItem>>,
+    withdrawal: Option<Withdrawal>,
+}
+
+impl<'a> Registration<'a> {
+    /// A new channel under `id`, replacing whatever was there, as a request
+    /// id has always done. What it replaced comes back if the request is not
+    /// written.
+    async fn replace(
+        channels: &'a RwLock<HashMap<i32, BroadcastSender>>,
+        cleanup: &'a mpsc::UnboundedSender<CleanupSignal>,
+        table: Table,
+        id: i32,
+    ) -> Registration<'a> {
+        let (sender, receiver) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
+        let ours = sender.downgrade();
+        let previous = channels.write().await.insert(id, sender);
+        Registration {
+            channels,
+            cleanup,
+            receiver: Some(receiver),
+            withdrawal: Some(Withdrawal { table, id, ours, previous }),
+        }
+    }
+
+    /// The channel under `id` if something still listens on it, joined with a
+    /// receiver of its own; otherwise a new one. A modify of an order keeps
+    /// the order's existing consumers this way.
+    async fn join(
+        channels: &'a RwLock<HashMap<i32, BroadcastSender>>,
+        cleanup: &'a mpsc::UnboundedSender<CleanupSignal>,
+        table: Table,
+        id: i32,
+    ) -> Registration<'a> {
+        let mut table_guard = channels.write().await;
+        let (ours, receiver) = match table_guard.get(&id) {
+            Some(existing) if existing.receiver_count() > 0 => (existing.downgrade(), existing.subscribe()),
+            _ => {
+                let (sender, receiver) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
+                let ours = sender.downgrade();
+                // Whatever was there had no listener left.
+                table_guard.insert(id, sender);
+                (ours, receiver)
+            }
+        };
+        Registration {
+            channels,
+            cleanup,
+            receiver: Some(receiver),
+            withdrawal: Some(Withdrawal {
+                table,
+                id,
+                ours,
+                previous: None,
+            }),
+        }
+    }
+
+    /// The request was written: the entry stays, released from now on by the
+    /// subscription's own cleanup, and what it replaced goes.
+    fn keep(mut self) -> (broadcast::Receiver<RoutedItem>, ChannelIdentity) {
+        let withdrawal = self.withdrawal.take().expect("armed until kept or withdrawn");
+        let receiver = self.receiver.take().expect("held until kept or withdrawn");
+        (receiver, withdrawal.ours)
+    }
+
+    /// The request was not written: undo the registration now.
+    async fn withdraw(mut self) {
+        drop(self.receiver.take());
+        let mut channels = self.channels.write().await;
+        if let Some(withdrawal) = self.withdrawal.take() {
+            withdrawal.apply(&mut channels);
+        }
+    }
+}
+
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        drop(self.receiver.take());
+        if let Some(withdrawal) = self.withdrawal.take() {
+            // The cleanup task lives as long as the bus; if it has gone, so
+            // have the tables.
+            let _ = self.cleanup.send(CleanupSignal::Withdraw(withdrawal));
+        }
+    }
 }
 
 /// Asynchronous message bus trait
@@ -80,6 +249,10 @@ pub struct AsyncInternalSubscription {
     cleanup_sender: Option<mpsc::UnboundedSender<CleanupSignal>>,
     cleanup_signal: Option<CleanupSignal>,
     cleanup_sent: bool,
+    /// Set once the channel dropped messages. The subscription has then
+    /// ended: nothing read after a loss is delivered, because an answer with
+    /// a hole in it is not the answer, whatever end marker follows.
+    lagged: bool,
 }
 
 impl Clone for AsyncInternalSubscription {
@@ -95,6 +268,7 @@ impl Clone for AsyncInternalSubscription {
             cleanup_sender: self.cleanup_sender.clone(),
             cleanup_signal: self.cleanup_signal.clone(),
             cleanup_sent: false, // Each clone should handle its own cleanup
+            lagged: false,
         }
     }
 }
@@ -120,6 +294,7 @@ impl AsyncInternalSubscription {
             cleanup_sender: None,
             cleanup_signal: None,
             cleanup_sent: false,
+            lagged: false,
         }
     }
 
@@ -135,18 +310,37 @@ impl AsyncInternalSubscription {
             cleanup_sender: Some(cleanup_sender),
             cleanup_signal: Some(cleanup_signal),
             cleanup_sent: false,
+            lagged: false,
         }
     }
 
+    /// The next response.
+    ///
+    /// A channel that dropped messages yields [`Error::Lagged`] once and then
+    /// `None`: a request that collects rows until its end marker must not
+    /// return the rows around a hole as the whole answer.
     pub async fn next(&mut self) -> Option<Result<ResponseMessage, Error>> {
         loop {
-            match self.stream.next().await? {
-                Ok(item) => {
-                    if let Some(legacy) = item.into_legacy() {
-                        return Some(legacy);
-                    }
-                }
-                Err(_lagged) => continue,
+            if let Some(legacy) = self.next_item().await?.into_legacy() {
+                return Some(legacy);
+            }
+        }
+    }
+
+    /// The next item as the dispatcher classified it, notices included: the
+    /// caller sees every notice bound to its request id, which [`next`](Self::next)
+    /// skips. A channel that dropped messages yields an [`Error::Lagged`] item
+    /// once and then `None`, as `next` does.
+    pub(crate) async fn next_item(&mut self) -> Option<RoutedItem> {
+        if self.lagged {
+            return None;
+        }
+        match self.stream.next().await? {
+            Ok(item) => Some(item),
+            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                warn!("subscription channel lagged, dropped {skipped} messages; ending it");
+                self.lagged = true;
+                Some(RoutedItem::Error(Error::Lagged(skipped)))
             }
         }
     }
@@ -193,6 +387,11 @@ impl AsyncInternalSubscription {
 /// Send cleanup signal when subscription is dropped
 impl Drop for AsyncInternalSubscription {
     fn drop(&mut self) {
+        // This subscription's receivers go first: the cleanup releases a
+        // channel's entry only once nothing listens on it.
+        let (_, closed) = broadcast::channel(1);
+        self.stream = BroadcastStream::new(closed.resubscribe());
+        self.template_receiver = closed;
         self.send_cleanup_signal();
     }
 }
@@ -223,6 +422,9 @@ pub struct AsyncTcpMessageBus<S: AsyncStream = AsyncTcpSocket> {
     /// Notification to wake the message loop on shutdown
     shutdown_notify: Arc<Notify>,
     connected: Arc<AtomicBool>,
+    /// Whether a socket error is answered by reconnecting in place (the
+    /// default) or by shutting down and letting the caller decide.
+    auto_reconnect: Arc<AtomicBool>,
 }
 
 impl<S: AsyncStream> Drop for AsyncTcpMessageBus<S> {
@@ -231,6 +433,7 @@ impl<S: AsyncStream> Drop for AsyncTcpMessageBus<S> {
         // Set the shutdown flag and notify the message loop to exit
         self.shutdown_requested.store(true, Ordering::Relaxed);
         self.shutdown_notify.notify_waiters();
+        self.connection.shutdown();
     }
 }
 
@@ -266,6 +469,7 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
             connected: Arc::new(AtomicBool::new(true)),
+            auto_reconnect: Arc::new(AtomicBool::new(true)),
         };
 
         // Start cleanup task
@@ -277,14 +481,14 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
             let mut receiver = cleanup_receiver;
             while let Some(signal) = receiver.recv().await {
                 match signal {
-                    CleanupSignal::Request(request_id) => {
+                    CleanupSignal::Request(request_id, ours) => {
                         let mut channels = request_channels.write().await;
-                        channels.remove(&request_id);
+                        release(&mut channels, request_id, &ours);
                         debug!("Cleaned up request channel for ID: {request_id}");
                     }
-                    CleanupSignal::Order(order_id) => {
+                    CleanupSignal::Order(order_id, ours) => {
                         let mut channels = order_channels.write().await;
-                        channels.remove(&order_id);
+                        release(&mut channels, order_id, &ours);
                         debug!("Cleaned up order channel for ID: {order_id}");
                     }
                     CleanupSignal::Shared(message_type) => {
@@ -297,11 +501,26 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
                         *stream = None;
                         debug!("Cleaned up order update stream ownership");
                     }
+                    CleanupSignal::Withdraw(withdrawal) => {
+                        let channels = match withdrawal.table {
+                            Table::Request => &request_channels,
+                            Table::Order => &order_channels,
+                        };
+                        let mut channels = channels.write().await;
+                        debug!("Withdrew an unsent {:?} registration for ID: {}", withdrawal.table, withdrawal.id);
+                        withdrawal.apply(&mut channels);
+                    }
                 }
             }
         });
 
         Ok(message_bus)
+    }
+
+    /// Answer a socket error by shutting down instead of reconnecting in
+    /// place. See `ClientBuilder::auto_reconnect`.
+    pub(crate) fn disable_auto_reconnect(&self) {
+        self.auto_reconnect.store(false, Ordering::Relaxed);
     }
 
     /// Start processing messages from TWS
@@ -324,12 +543,28 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
 
                         match result {
                             Ok(_) => continue,
+                            // A shutdown closes the socket, which fails this
+                            // read: that is the end, never a reason to
+                            // reconnect.
+                            Err(_) if message_bus.shutdown_requested.load(Ordering::Relaxed) => {
+                                debug!("dispatcher task exiting after shutdown");
+                                break;
+                            }
                             Err(ref err) if is_timeout_error(err) => {
                                 if message_bus.shutdown_requested.load(Ordering::Relaxed) {
                                     debug!("dispatcher task exiting");
                                     break;
                                 }
                                 continue;
+                            }
+                            Err(ref err) if is_connection_error(err) && !message_bus.auto_reconnect.load(Ordering::Relaxed) => {
+                                // The caller supervises the connection itself:
+                                // report the failure by ending, rather than
+                                // replaying the handshake behind it.
+                                error!("Connection error detected; auto-reconnect is off, shutting down: {err:?}");
+                                message_bus.connected.store(false, Ordering::Relaxed);
+                                message_bus.request_shutdown().await;
+                                break;
                             }
                             Err(ref err) if is_connection_error(err) => {
                                 error!("Connection error detected, attempting to reconnect: {err:?}");
@@ -427,13 +662,17 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
         }
     }
 
-    /// Notify all waiting subscriptions about shutdown
+    /// Close the connection and notify all waiting subscriptions.
+    ///
+    /// The socket is closed for real first: from then on no message is sent,
+    /// and the peer sees the connection end, whatever else is in progress.
     async fn request_shutdown(&self) {
         debug!("shutdown requested");
 
         // Set the shutdown flag and mark as disconnected
         self.connected.store(false, Ordering::Relaxed);
         self.shutdown_requested.store(true, Ordering::Relaxed);
+        self.connection.shutdown();
         self.shutdown_notify.notify_waiters();
 
         // Clear all channels - dropping the senders will close the channels
@@ -675,36 +914,34 @@ impl<S: AsyncStream> AsyncTcpMessageBus<S> {
 #[async_trait]
 impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
     async fn send_request(&self, request_id: i32, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
-        let (sender, receiver) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
+        let registration = Registration::replace(&self.request_channels, &self.cleanup_sender, Table::Request, request_id).await;
 
-        {
-            let mut channels = self.request_channels.write().await;
-            channels.insert(request_id, sender);
+        if let Err(error) = self.connection.write_message_for(&message, Some(request_id)).await {
+            registration.withdraw().await;
+            return Err(error);
         }
-
-        self.connection.write_message(&message).await?;
+        let (receiver, ours) = registration.keep();
 
         Ok(AsyncInternalSubscription::with_cleanup(
             receiver,
             self.cleanup_sender.clone(),
-            CleanupSignal::Request(request_id),
+            CleanupSignal::Request(request_id, ours),
         ))
     }
 
     async fn send_order_request(&self, order_id: i32, message: Vec<u8>) -> Result<AsyncInternalSubscription, Error> {
-        let (sender, receiver) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
+        let registration = Registration::join(&self.order_channels, &self.cleanup_sender, Table::Order, order_id).await;
 
-        {
-            let mut channels = self.order_channels.write().await;
-            channels.insert(order_id, sender);
+        if let Err(error) = self.connection.write_message(&message).await {
+            registration.withdraw().await;
+            return Err(error);
         }
-
-        self.connection.write_message(&message).await?;
+        let (receiver, ours) = registration.keep();
 
         Ok(AsyncInternalSubscription::with_cleanup(
             receiver,
             self.cleanup_sender.clone(),
-            CleanupSignal::Order(order_id),
+            CleanupSignal::Order(order_id, ours),
         ))
     }
 
@@ -735,7 +972,7 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
     }
 
     async fn cancel_subscription(&self, request_id: i32, message: Vec<u8>) -> Result<(), Error> {
-        self.connection.write_message(&message).await?;
+        self.connection.write_message_for(&message, Some(request_id)).await?;
 
         // Single write lock: the previous version held a read guard while
         // awaiting the write upgrade and self-deadlocked on the same task.
@@ -794,12 +1031,16 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
             task_guard.take()
         };
 
-        if let Some(handle) = task_handle {
+        if let Some(mut handle) = task_handle {
             debug!("Waiting for processing task to finish");
-            if let Err(e) = handle.await {
-                warn!("Error joining processing task: {e}");
+            match tokio::time::timeout(DISPATCHER_JOIN_TIMEOUT, &mut handle).await {
+                Ok(Ok(())) => debug!("Processing task finished"),
+                Ok(Err(e)) => warn!("Error joining processing task: {e}"),
+                Err(_) => {
+                    warn!("processing task still running {DISPATCHER_JOIN_TIMEOUT:?} after the socket closed; aborting it");
+                    handle.abort();
+                }
             }
-            debug!("Processing task finished");
         }
     }
 
@@ -807,6 +1048,7 @@ impl<S: AsyncStream> AsyncMessageBus for AsyncTcpMessageBus<S> {
         debug!("sync shutdown requested");
         self.connected.store(false, Ordering::Relaxed);
         self.shutdown_requested.store(true, Ordering::Relaxed);
+        self.connection.shutdown();
         self.shutdown_notify.notify_waiters();
     }
 
@@ -828,3 +1070,15 @@ pub(crate) mod test_listener;
 #[cfg(test)]
 #[path = "async_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "async_close_tests.rs"]
+mod close_tests;
+
+#[cfg(test)]
+#[path = "async_gate_tests.rs"]
+mod gate_tests;
+
+#[cfg(test)]
+#[path = "async_bus_gate_tests.rs"]
+mod bus_gate_tests;

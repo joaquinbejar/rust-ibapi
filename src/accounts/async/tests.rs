@@ -521,3 +521,27 @@ async fn test_account_summary_multiple_tags() {
         }
     }
 }
+
+// Gateway 10.45.1j, server 221: dropping an account summary writes the legacy
+// cancel, byte for byte (see AccountSummaryCancelCodec).
+#[tokio::test]
+async fn test_account_summary_cancel_is_legacy_on_server_221() {
+    let (client, message_bus) =
+        create_test_client_with_responses_and_version(vec![account_summary().encode_pipe(), account_summary_end().encode_pipe()], 221);
+    let group = AccountGroup("All".to_string());
+    let mut subscription = client
+        .account_summary(&group, &[AccountSummaryTags::NET_LIQUIDATION])
+        .await
+        .expect("request account_summary failed");
+    let _ = subscription.next().await;
+    let _ = subscription.next().await;
+    drop(subscription);
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let requests = message_bus.request_messages();
+    assert_eq!(requests.len(), 2);
+    let expected = format!("1\0{TEST_REQ_ID_FIRST}\0");
+    let mut legacy = 63i32.to_be_bytes().to_vec();
+    legacy.extend_from_slice(expected.as_bytes());
+    assert_eq!(requests[1], legacy);
+}

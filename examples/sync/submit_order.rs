@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match update {
                         OrderUpdate::OrderStatus(status) => {
                             println!(
-                                "[Monitor] Order {} Status: {} - Filled: {}/{}",
+                                "[Monitor] Order {} Status: {} - Filled: {:?}/{:?}",
                                 status.order_id, status.status, status.filled, status.remaining
                             );
                         }
@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                         OrderUpdate::CommissionReport(report) => {
-                            println!("[Monitor] Commission: ${} for execution {}", report.commission, report.execution_id);
+                            println!("[Monitor] Commission: {:?} for execution {}", report.commission, report.execution_id);
                         }
                     }
                 }

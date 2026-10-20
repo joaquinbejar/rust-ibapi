@@ -168,7 +168,7 @@ mod position_update_tests {
                 assert_eq!(pos.account, TEST_ACCOUNT);
                 assert_eq!(pos.contract.contract_id, 12345);
                 assert_eq!(pos.position as i32, 100);
-                assert_eq!(pos.average_cost, 50.25);
+                assert_eq!(pos.average_cost, Some(50.25));
             }
             _ => panic!("Expected Position variant"),
         }

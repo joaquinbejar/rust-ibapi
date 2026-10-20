@@ -241,6 +241,14 @@ fn test_is_warning_error() {
     assert!(!is_warning_error(2170));
     assert!(!is_warning_error(200));
     assert!(!is_warning_error(2200));
+
+    // Market-data information about a subscription that stays open.
+    assert!(is_warning_error(10167));
+    assert!(is_warning_error(10090));
+    // Market-data refusals still end the subscription.
+    assert!(!is_warning_error(354));
+    assert!(!is_warning_error(10089));
+    assert!(!is_warning_error(10168));
 }
 
 #[test]
@@ -369,5 +377,22 @@ fn test_determine_routing_protobuf_request_id_message() {
     match determine_routing(&message) {
         RoutingDecision::ByRequestId(id) => assert_eq!(id, 314),
         routing => panic!("Expected ByRequestId(314), got {routing:?}"),
+    }
+}
+
+/// IB's marketDataType names the request it is for, and is routed to that
+/// subscription, not to a shared channel no market-data subscription reads.
+#[test]
+fn test_market_data_type_routes_by_request_id() {
+    use prost::Message as _;
+    let body = crate::proto::MarketDataType {
+        req_id: Some(42),
+        market_data_type: Some(3),
+    }
+    .encode_to_vec();
+    let message = ResponseMessage::from_protobuf(IncomingMessages::MarketDataType as i32, body, crate::server_versions::PROTOBUF);
+    match determine_routing(&message) {
+        RoutingDecision::ByRequestId(42) => {}
+        other => panic!("expected ByRequestId(42), got {other:?}"),
     }
 }

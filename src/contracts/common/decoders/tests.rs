@@ -2,18 +2,14 @@ use super::*;
 use crate::contracts::tick_types::TickType;
 
 #[test]
-fn test_next_optional_double() {
-    let mut message = ResponseMessage::from_simple("1.25|2.50|-1.0|-2.0|");
+fn test_next_raw_double() {
+    let mut message = ResponseMessage::from_simple("1.25||-1.0|-2.0|abc|");
 
-    let result1 = next_optional_double(&mut message, -1.0).expect("error decoding optional double");
-    let result2 = next_optional_double(&mut message, -1.0).expect("error decoding optional double");
-    let result3 = next_optional_double(&mut message, -1.0).expect("error decoding optional double");
-    let result4 = next_optional_double(&mut message, -2.0).expect("error decoding optional double");
-
-    assert_eq!(result1, Some(1.25), "result1 should be Some(1.25)");
-    assert_eq!(result2, Some(2.50), "result2 should be Some(2.50)");
-    assert_eq!(result3, None, "result3 should be None because it matches none_value (-1.0)");
-    assert_eq!(result4, None, "result4 should be None because it matches none_value (-2.0)");
+    assert_eq!(next_raw_double(&mut message).unwrap(), Some(1.25));
+    assert_eq!(next_raw_double(&mut message).unwrap(), None, "an empty field is not 0.0");
+    assert_eq!(next_raw_double(&mut message).unwrap(), Some(-1.0), "a sentinel is kept as sent");
+    assert_eq!(next_raw_double(&mut message).unwrap(), Some(-2.0));
+    assert!(next_raw_double(&mut message).is_err(), "a value that is not a number is an error");
 }
 
 #[test]
@@ -33,6 +29,67 @@ fn test_decode_option_computation() {
     assert_eq!(computation.vega, Some(0.15), "computation.vega");
     assert_eq!(computation.theta, Some(0.10), "computation.theta");
     assert_eq!(computation.underlying_price, Some(150.0), "computation.underlying_price");
+}
+
+// === D14 item 6: option computation, text path ===
+
+fn decode_text_computation(fields: &str) -> Result<OptionComputation, Error> {
+    let mut message = ResponseMessage::from_simple(fields);
+    decode_option_computation(server_versions::PRICE_BASED_VOLATILITY, &mut message)
+}
+
+#[test]
+fn test_option_computation_text_not_computed_sentinels_are_absent_and_kept_raw() {
+    let computation = decode_text_computation("10|123|13|1|-1|-2|-1|-1|-2|-2|-2|-1|").expect("decodes");
+
+    assert_eq!(
+        (
+            computation.implied_volatility,
+            computation.delta,
+            computation.option_price,
+            computation.present_value_dividend,
+            computation.gamma,
+            computation.vega,
+            computation.theta,
+            computation.underlying_price
+        ),
+        (None, None, None, None, None, None, None, None)
+    );
+    let raw = computation.raw;
+    assert_eq!(raw.tick_type, 13);
+    assert_eq!(
+        (raw.implied_volatility, raw.delta, raw.present_value_dividend, raw.theta),
+        (Some(-1.0), Some(-2.0), Some(-1.0), Some(-2.0))
+    );
+}
+
+#[test]
+fn test_option_computation_text_empty_and_unset_values_are_absent() {
+    // An empty field was 0.0 through next_double; IB's unset maximum is kept raw.
+    let computation = decode_text_computation("10|123|13|1||1.7976931348623157E308|||||||").expect("decodes");
+
+    assert_eq!(computation.implied_volatility, None);
+    assert_eq!(computation.raw.implied_volatility, None, "empty: not sent");
+    assert_eq!(computation.delta, None);
+    assert_eq!(computation.raw.delta, Some(f64::MAX), "unset: kept as sent");
+    assert_eq!(computation.underlying_price, None);
+}
+
+#[test]
+fn test_option_computation_text_sentinels_are_per_field() {
+    // Negative control: a theta of -1 and a stated zero are values.
+    let computation = decode_text_computation("10|123|13|1|0|-0.5|5|0|0.1|0.2|-1|-2|").expect("decodes");
+
+    assert_eq!(computation.implied_volatility, Some(0.0));
+    assert_eq!(computation.delta, Some(-0.5));
+    assert_eq!(computation.theta, Some(-1.0));
+    assert_eq!(computation.underlying_price, Some(-2.0));
+}
+
+#[test]
+fn test_option_computation_text_without_tick_type_is_an_error() {
+    let result = decode_text_computation("10|123||1|0.25|0.5|5|0|0.1|0.2|-0.1|150|");
+    assert!(matches!(result, Err(Error::Parse(..))), "got {result:?}");
 }
 
 use prost::Message;

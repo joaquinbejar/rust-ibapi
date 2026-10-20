@@ -1,8 +1,8 @@
 use prost::Message;
 
-use crate::contracts::OptionComputation;
+use crate::contracts::{OptionComputation, OptionComputationRaw};
 use crate::messages::ResponseMessage;
-use crate::proto::decoders::{optional_f64, optional_string_f64, parse_f64, ts};
+use crate::proto::decoders::{parse_f64, ts};
 use crate::server_versions;
 use crate::Error;
 
@@ -217,12 +217,32 @@ pub(crate) fn decode_tick_request_parameters_proto(bytes: &[u8]) -> Result<TickR
     })
 }
 
+/// A size field as IB sent it: `None` when the message carried none, an empty
+/// one, or IB's unset value; otherwise its text, exactly, with its `f64`.
+///
+/// The text is kept whether or not it parses: a size that is not a number is
+/// still evidence that IB sent one, and a consumer that reads sizes from the
+/// text must see it and refuse it, not find nothing. Its `f64` is then NaN,
+/// never a plausible number.
+fn reported_size(opt: &Option<String>) -> Option<(f64, String)> {
+    let text = opt.as_ref()?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    match text.trim().parse::<f64>() {
+        Ok(value) if value == f64::MAX => None,
+        Ok(value) => Some((value, text.clone())),
+        Err(_) => Some((f64::NAN, text.clone())),
+    }
+}
+
 pub(crate) fn decode_tick_price_proto(bytes: &[u8]) -> Result<TickTypes, Error> {
     let msg = crate::proto::TickPrice::decode(bytes)?;
 
     let tick_type = TickType::from(msg.tick_type.unwrap_or_default());
+    let price_present = msg.price.is_some();
     let price = msg.price.unwrap_or_default();
-    let size = optional_string_f64(&msg.size);
+    let reported = reported_size(&msg.size);
     let attr_mask = msg.attr_mask.unwrap_or_default();
 
     let attributes = TickAttribute {
@@ -241,18 +261,21 @@ pub(crate) fn decode_tick_price_proto(bytes: &[u8]) -> Result<TickTypes, Error> 
         _ => TickType::Unknown,
     };
 
-    match (size_tick_type, size) {
+    match (size_tick_type, reported) {
         (TickType::Unknown, _) | (_, None) => Ok(TickTypes::Price(TickPrice {
             tick_type,
             price,
+            price_present,
             attributes,
         })),
-        (size_tick_type, Some(size)) => Ok(TickTypes::PriceSize(TickPriceSize {
+        (size_tick_type, Some((size, size_text))) => Ok(TickTypes::PriceSize(TickPriceSize {
             price_tick_type: tick_type,
             price,
+            price_present,
             attributes,
             size_tick_type,
             size,
+            size_text: Some(size_text),
         })),
     }
 }
@@ -260,9 +283,13 @@ pub(crate) fn decode_tick_price_proto(bytes: &[u8]) -> Result<TickTypes, Error> 
 pub(crate) fn decode_tick_size_proto(bytes: &[u8]) -> Result<TickSize, Error> {
     let msg = crate::proto::TickSize::decode(bytes)?;
 
+    let reported = reported_size(&msg.size);
     Ok(TickSize {
         tick_type: TickType::from(msg.tick_type.unwrap_or_default()),
-        size: parse_f64(&msg.size),
+        // Absent or unset stays 0.0, as before; a size that is not a number
+        // is NaN rather than 0.0.
+        size: reported.as_ref().map_or_else(|| parse_f64(&msg.size), |(value, _)| *value),
+        size_text: reported.map(|(_, text)| text),
     })
 }
 
@@ -287,18 +314,22 @@ pub(crate) fn decode_tick_generic_proto(bytes: &[u8]) -> Result<TickGeneric, Err
 pub(crate) fn decode_tick_option_computation_proto(bytes: &[u8]) -> Result<OptionComputation, Error> {
     let msg = crate::proto::TickOptionComputation::decode(bytes)?;
 
-    Ok(OptionComputation {
-        field: TickType::from(msg.tick_type.unwrap_or_default()),
-        tick_attribute: msg.tick_attrib,
-        implied_volatility: optional_f64(msg.implied_vol),
-        delta: optional_f64(msg.delta),
-        option_price: optional_f64(msg.opt_price),
-        present_value_dividend: optional_f64(msg.pv_dividend),
-        gamma: optional_f64(msg.gamma),
-        vega: optional_f64(msg.vega),
-        theta: optional_f64(msg.theta),
-        underlying_price: optional_f64(msg.und_price),
-    })
+    // An absent tick type is not type 0 (BidSize): the computation is unreadable.
+    let tick_type = msg
+        .tick_type
+        .ok_or_else(|| Error::parse_proto("tick_type", "missing in TickOptionComputation"))?;
+    let raw = OptionComputationRaw {
+        tick_type,
+        implied_volatility: msg.implied_vol,
+        delta: msg.delta,
+        option_price: msg.opt_price,
+        present_value_dividend: msg.pv_dividend,
+        gamma: msg.gamma,
+        vega: msg.vega,
+        theta: msg.theta,
+        underlying_price: msg.und_price,
+    };
+    Ok(OptionComputation::from_raw(raw, msg.tick_attrib))
 }
 
 pub(crate) fn decode_market_depth_proto(bytes: &[u8]) -> Result<MarketDepth, Error> {

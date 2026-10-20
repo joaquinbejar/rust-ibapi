@@ -372,6 +372,55 @@ async fn test_subscription_notice_delivery_request_keyed() {
     }
 }
 
+/// Market-data information (10167, "displaying delayed market data")
+/// repeated on a subscription: each arrives as a notice, the stream stays
+/// open, data keeps flowing, and nothing is sent to the Gateway because of it.
+/// As a terminal error each one would end the subscription, and a consumer
+/// that requested again on every end would loop.
+#[tokio::test]
+async fn test_repeated_market_data_notice_keeps_the_subscription_and_sends_nothing() {
+    let (stream, bus, mut subscription) = make_request_subscription(42).await;
+    let sent_before = stream.captured().len();
+
+    for _ in 0..3 {
+        stream.push_inbound(body(
+            "4|2|42|10167|Requested market data is not subscribed. Displaying delayed market data.|",
+        ));
+        bus.read_and_route_message().await.unwrap();
+        match next_item(&mut subscription).await {
+            Some(Ok(SubscriptionItem::Notice(notice))) => {
+                assert_eq!(notice.code, 10167);
+                assert!(notice.is_market_data_notice());
+            }
+            other => panic!("expected SubscriptionItem::Notice, got {other:?}"),
+        }
+    }
+
+    stream.push_inbound(body("89|42|payload|"));
+    bus.read_and_route_message().await.unwrap();
+    match next_item(&mut subscription).await {
+        Some(Ok(SubscriptionItem::Data(_))) => {}
+        other => panic!("expected SubscriptionItem::Data, got {other:?}"),
+    }
+    assert_eq!(stream.captured().len(), sent_before, "no cancel and no new request was sent");
+}
+
+/// A market-data refusal (10168, delayed data not enabled) still ends the
+/// subscription: only the informational codes became notices.
+#[tokio::test]
+async fn test_market_data_refusal_still_terminates() {
+    let (stream, bus, mut subscription) = make_request_subscription(42).await;
+    stream.push_inbound(body(
+        "4|2|42|10168|Requested market data is not subscribed. Delayed market data is not enabled.|",
+    ));
+    bus.read_and_route_message().await.unwrap();
+    match next_item(&mut subscription).await {
+        Some(Err(Error::Notice(notice))) => assert_eq!(notice.code, 10168),
+        other => panic!("expected Some(Err(Error::Notice)), got {other:?}"),
+    }
+    assert!(next_item(&mut subscription).await.is_none());
+}
+
 /// Hard error (code 200) surfaces as `Some(Err(_))`; subsequent reads return `None`.
 #[tokio::test]
 async fn test_subscription_hard_error_terminates_stream() {
@@ -761,4 +810,65 @@ async fn test_send_shared_request_unsupported_returns_error() {
         Err(Error::InvalidArgument(_)) => {}
         other => panic!("expected Error::InvalidArgument, got {:?}", other.err()),
     }
+}
+
+/// With auto-reconnect off, a socket failure ends the dispatcher and turns
+/// `is_connected()` false, and no reconnect is attempted: the caller that
+/// supervises the connection learns of the loss instead of the transport
+/// replaying the handshake on the same client id behind it.
+#[tokio::test]
+async fn test_a_socket_failure_without_auto_reconnect_shuts_down_and_does_not_reconnect() {
+    let (stream, bus) = make_bus();
+    stream.set_reconnect_failures(1000);
+    bus.disable_auto_reconnect();
+
+    let mb: &dyn AsyncMessageBus = bus.as_ref();
+    assert!(mb.is_connected());
+
+    stream.close();
+    bus.clone().process_messages(0, TICK).expect("the dispatcher starts");
+
+    let started = std::time::Instant::now();
+    while mb.is_connected() {
+        assert!(started.elapsed() < Duration::from_secs(2), "the dispatcher did not report the loss");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        stream.reconnect_failures_remaining(),
+        1000,
+        "a reconnect was attempted although auto-reconnect is off"
+    );
+}
+
+/// The default is unchanged: a socket failure is answered by reconnecting.
+#[tokio::test]
+async fn test_a_socket_failure_with_auto_reconnect_attempts_a_reconnect() {
+    let (stream, bus) = make_bus();
+    stream.set_reconnect_failures(1000);
+
+    stream.close();
+    bus.clone().process_messages(0, TICK).expect("the dispatcher starts");
+
+    let started = std::time::Instant::now();
+    while stream.reconnect_failures_remaining() == 1000 {
+        assert!(started.elapsed() < Duration::from_secs(2), "no reconnect was attempted");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mb: &dyn AsyncMessageBus = bus.as_ref();
+    mb.request_shutdown_sync();
+}
+
+#[tokio::test]
+async fn test_internal_next_reports_a_lag_once_and_then_ends() {
+    // What one-shot collectors (contract details and the like) read through.
+    // They collect rows until the end marker; a lag skipped here would have
+    // them return the rows around the hole as the whole answer.
+    let (tx, rx) = tokio::sync::broadcast::channel(1);
+    let mut internal = AsyncInternalSubscription::new(rx);
+    tx.send(crate::messages::ResponseMessage::from("10\x001\0").into()).unwrap();
+    tx.send(crate::messages::ResponseMessage::from("52\x001\0").into()).unwrap();
+
+    let first = internal.next().await;
+    assert!(matches!(first, Some(Err(Error::Lagged(1)))), "a lost row was not reported: {first:?}");
+    assert!(internal.next().await.is_none(), "the end marker after the loss was delivered");
 }

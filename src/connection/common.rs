@@ -15,6 +15,27 @@ use crate::messages::{
 use crate::orders::{CommissionReport, ExecutionData, OrderData, OrderStatus};
 use crate::server_versions;
 
+/// IB's "Unable to connect as the client id is already in use".
+///
+/// The gateway sends it during the handshake and closes the socket. Without
+/// recognising it, the caller sees the close as a generic transport failure
+/// and cannot tell "the gateway is unreachable" from "another connection holds
+/// this client id", which a supervisor must treat differently: retrying the
+/// second in a tight loop fights whoever holds the id.
+pub(crate) const CLIENT_ID_IN_USE_CODE: i32 = 326;
+
+/// The duplicate-client-id refusal, if this handshake-time message is one.
+///
+/// Returned as [`Error::Notice`] carrying the gateway's own notice, so a
+/// caller matches on `notice.code == 326` with no string parsing.
+pub(crate) fn client_id_refusal(message: &ResponseMessage) -> Option<Notice> {
+    if message.message_type() != IncomingMessages::Error {
+        return None;
+    }
+    let notice = Notice::from(message);
+    (notice.code == CLIENT_ID_IN_USE_CODE).then_some(notice)
+}
+
 /// Domain-typed messages delivered to the startup callback during the
 /// connection handshake (initial connect *and* auto-reconnect).
 ///

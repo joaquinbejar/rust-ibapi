@@ -23,7 +23,7 @@ use thiserror::Error;
 use serde::{Deserialize, Serialize};
 use time::{Date, OffsetDateTime};
 
-use crate::messages::{IncomingMessages, ResponseMessage};
+use crate::messages::{IncomingMessages, Notice, ResponseMessage};
 use crate::subscriptions::{DecoderContext, StreamDecoder};
 use crate::{Error, ToField};
 
@@ -58,26 +58,34 @@ pub enum HistoricalParseError {
 }
 
 /// Bar describes the historical data bar.
+///
+/// Every value is exactly what IB stated for the bar. A value IB left out is
+/// `None`, never `0.0`: an absent price is not a price of zero. Values IB does
+/// state are kept as stated, zero and negative included (IB sends `-1` for
+/// volume, WAP and count on bar types that do not carry them, such as
+/// `MIDPOINT`). A bar whose time is absent or unreadable is not a bar: the
+/// decoder fails instead of inventing one.
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, PartialEq, Copy, Serialize, Deserialize)]
 pub struct Bar {
-    /// The bar's date and time (either as a yyyymmss hh:mm:ss formatted string or as system time according to the request). Time zone is the TWS time zone chosen on login.
-    // pub time: OffsetDateTime,
+    /// The bar's start time, as IB stated it (a date for daily and longer bars,
+    /// at midnight UTC; an instant in the session's time zone otherwise).
     pub date: OffsetDateTime,
-    /// The bar's open price.
-    pub open: f64,
-    /// The bar's high price.
-    pub high: f64,
-    /// The bar's low price.
-    pub low: f64,
-    /// The bar's close price.
-    pub close: f64,
-    /// The bar's traded volume if available (only available for TRADES)
-    pub volume: f64,
-    /// The bar's Weighted Average Price (only available for TRADES)
-    pub wap: f64,
-    /// The number of trades during the bar's timespan (only available for TRADES)
-    pub count: i32,
+    /// The bar's open price, `None` when IB left it out.
+    pub open: Option<f64>,
+    /// The bar's high price, `None` when IB left it out.
+    pub high: Option<f64>,
+    /// The bar's low price, `None` when IB left it out.
+    pub low: Option<f64>,
+    /// The bar's close price, `None` when IB left it out.
+    pub close: Option<f64>,
+    /// The bar's traded volume, `None` when IB left it out.
+    pub volume: Option<f64>,
+    /// The bar's weighted average price, `None` when IB left it out.
+    pub wap: Option<f64>,
+    /// The number of trades during the bar's timespan, `None` when IB left it
+    /// out (including text messages older than version 3, which carry none).
+    pub count: Option<i32>,
 }
 
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
@@ -348,12 +356,41 @@ pub struct HistogramEntry {
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HistoricalData {
-    /// Start timestamp of the requested window.
-    pub start: OffsetDateTime,
-    /// End timestamp of the requested window.
-    pub end: OffsetDateTime,
+    /// Start of the window, as IB stated it: from the `HistoricalDataEnd`
+    /// message (or, on servers older than `HISTORICAL_DATA_END`, from the data
+    /// message itself). `None` until IB states it, so a window IB never
+    /// confirmed cannot be read as a proven one.
+    pub start: Option<OffsetDateTime>,
+    /// End of the window, as IB stated it; `None` until IB states it, as
+    /// [`start`](Self::start).
+    pub end: Option<OffsetDateTime>,
     /// Bar data returned by the request.
     pub bars: Vec<Bar>,
+    /// The notices IB sent for this request before its answer ended, in the
+    /// order they arrived, each with IB's code and text: the warnings that do
+    /// not end a request ([`HISTORICAL_DATA_NOTICE_CODES`] and the 2100-2169
+    /// range). Empty on the streaming variant, which yields its notices as
+    /// [`SubscriptionItem::Notice`](crate::subscriptions::SubscriptionItem::Notice).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<Notice>,
+}
+
+/// IB codes that inform about a historical data request without ending it,
+/// beyond the 2100-2169 warnings every request treats that way.
+///
+/// - 2174: the request's date-time has no explicit time zone; IB still serves
+///   it.
+///
+/// A one-shot request ([`HistoricalDataBuilder::fetch`],
+/// `HistoricalDataRequest`) keeps them in [`HistoricalData::notices`] and
+/// keeps waiting for its answer. Any other error code for the request ends it
+/// as [`Error::Notice`], with IB's code and text.
+pub const HISTORICAL_DATA_NOTICE_CODES: [i32; 1] = [2174];
+
+/// Whether an IB code bound to a historical data request informs about it
+/// without ending it.
+pub(crate) fn is_historical_data_notice(code: i32) -> bool {
+    crate::transport::routing::is_warning_error(code) || HISTORICAL_DATA_NOTICE_CODES.contains(&code)
 }
 
 /// Update from historical data streaming with keepUpToDate=true.
@@ -613,7 +650,7 @@ pub use sync::*;
 // Async API methods are now on Client directly via historical/async.rs
 // Re-export non-function items
 #[cfg(feature = "async")]
-pub use r#async::TickSubscription;
+pub use r#async::{HistoricalDataRequest, TickSubscription};
 
 /// Trait implemented by historical tick types that can decode IB messages.
 ///

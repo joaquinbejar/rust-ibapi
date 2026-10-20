@@ -151,3 +151,64 @@ fn test_no_retries_after_end_of_stream() {
     assert!(sub.next().is_none());
     assert!(sub.stream_ended.load(Ordering::Relaxed));
 }
+
+/// `try_cancel` says whether the cancel request was written; a failed write
+/// leaves the subscription not cancelled, and a retry writes it.
+#[test]
+fn test_subscription_try_cancel_reports_the_write() {
+    use crate::transport::SubscriptionBuilder;
+    use crossbeam::channel;
+
+    let (_sender, receiver) = channel::unbounded();
+    let (signaler, _) = channel::unbounded();
+    let internal = SubscriptionBuilder::new().receiver(receiver).signaler(signaler).request_id(7).build();
+    let stub = Arc::new(MessageBusStub::default());
+    let sub: Subscription<EndOfStreamItem> = Subscription::new(stub.clone(), internal, DecoderContext::default());
+
+    stub.set_fail_sends(true);
+    assert!(matches!(sub.try_cancel(), Err(Error::ConnectionReset)));
+    assert!(stub.request_messages().is_empty());
+
+    stub.set_fail_sends(false);
+    assert!(sub.try_cancel().is_ok());
+    assert_eq!(stub.request_messages().len(), 1, "written once");
+    assert!(sub.try_cancel().is_ok(), "already cancelled");
+    assert_eq!(stub.request_messages().len(), 1, "and nothing written again");
+}
+
+/// The reviewer's case (ACS 1253), sync: a failed best-effort `cancel()` does
+/// not make a later `try_cancel` report a cancel that was never written.
+#[test]
+fn test_try_cancel_after_a_failed_best_effort_cancel_still_writes() {
+    use crate::transport::SubscriptionBuilder;
+    use crossbeam::channel;
+
+    let (_sender, receiver) = channel::unbounded();
+    let (signaler, _) = channel::unbounded();
+    let internal = SubscriptionBuilder::new().receiver(receiver).signaler(signaler).request_id(8).build();
+    let stub = Arc::new(MessageBusStub::default());
+    let sub: Subscription<EndOfStreamItem> = Subscription::new(stub.clone(), internal, DecoderContext::default());
+
+    stub.set_fail_sends(true);
+    sub.cancel();
+    assert!(stub.request_messages().is_empty(), "nothing was written");
+
+    stub.set_fail_sends(false);
+    assert!(sub.try_cancel().is_ok());
+    assert_eq!(stub.request_messages().len(), 1, "the cancel request is written now");
+}
+
+/// A subscription that cannot address a cancel request cannot prove one went out.
+#[test]
+fn test_try_cancel_without_a_way_to_address_it_is_an_error() {
+    use crate::transport::SubscriptionBuilder;
+    use crossbeam::channel;
+
+    let (_sender, receiver) = channel::unbounded();
+    let (signaler, _) = channel::unbounded();
+    let internal = SubscriptionBuilder::new().receiver(receiver).signaler(signaler).build();
+    let stub = Arc::new(MessageBusStub::default());
+    let sub: Subscription<EndOfStreamItem> = Subscription::new(stub.clone(), internal, DecoderContext::default());
+    assert!(matches!(sub.try_cancel(), Err(Error::InvalidArgument(_))));
+    assert!(stub.request_messages().is_empty());
+}

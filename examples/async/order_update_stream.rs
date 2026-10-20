@@ -37,8 +37,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     println!("Order Status Update:");
                     println!("  Order ID: {}", status.order_id);
                     println!("  Status: {}", status.status);
-                    println!("  Filled: {}", status.filled);
-                    println!("  Remaining: {}", status.remaining);
+                    println!("  Filled: {:?}", status.filled);
+                    println!("  Remaining: {:?}", status.remaining);
                     match status.average_fill_price {
                         Some(price) => println!("  Avg Fill Price: {price}"),
                         None => println!("  Avg Fill Price: -"),
@@ -65,7 +65,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 Ok(OrderUpdate::CommissionReport(report)) => {
                     println!("Commission Report:");
                     println!("  Execution ID: {}", report.execution_id);
-                    println!("  Commission: {} {}", report.commission, report.currency);
+                    println!("  Commission: {:?} {}", report.commission, report.currency);
                 }
                 Err(e) => {
                     eprintln!("Error in order stream: {e:?}");

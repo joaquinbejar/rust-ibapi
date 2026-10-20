@@ -139,13 +139,20 @@ pub use client::Client;
 #[doc(inline)]
 pub use client::ClientBuilder;
 
+/// Why a write was refused before any byte ([`Error::Refused`]).
+pub use errors::{GateReason, Refusal, Waiting};
+/// The write gate a client can be built with (async only): see
+/// [`ClientBuilder::write_gate`].
+#[cfg(feature = "async")]
+pub use transport::write_gate::{Admit, Deadline, OutgoingMeta, WriteCall, WriteGate};
+
 #[doc(inline)]
 pub use messages::{IncomingMessages, Notice, NoticeCategory, OutgoingMessages};
 
 #[doc(inline)]
 pub use messages::{
-    HANDSHAKE_DECODE_FAILURE_CODE, HANDSHAKE_UNKNOWN_FRAME_CODE, ORDER_CANCELLED_CODE, ORDER_REJECTION_CODE_RANGE, SYSTEM_MESSAGE_CODES,
-    WARNING_CODE_RANGE,
+    HANDSHAKE_DECODE_FAILURE_CODE, HANDSHAKE_UNKNOWN_FRAME_CODE, MARKET_DATA_NOTICE_CODES, ORDER_CANCELLED_CODE, ORDER_REJECTION_CODE_RANGE,
+    SYSTEM_MESSAGE_CODES, WARNING_CODE_RANGE,
 };
 
 #[doc(hidden)]
@@ -263,6 +270,3 @@ fn encode_option_field<T: ToField>(val: &Option<T>) -> String {
         None => String::from(""),
     }
 }
-
-// max attempts to retry failed tws requests
-const MAX_RETRIES: i32 = 5;

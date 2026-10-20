@@ -11,7 +11,7 @@ use crate::messages::IncomingMessages;
 use crate::protocol::{check_version, Features};
 use crate::subscriptions::sync::Subscription;
 use crate::transport::{InternalSubscription, MessageBus, Response};
-use crate::{client::sync::Client, Error, MAX_RETRIES};
+use crate::{client::sync::Client, Error};
 
 use super::common::{self, decoders, encoders};
 use super::{BarSize, Duration, HistogramEntry, HistoricalBarUpdate, HistoricalData, Schedule, TickDecoder, WhatToShow};
@@ -40,17 +40,18 @@ impl Client {
         check_version(self.server_version(), Features::HEAD_TIMESTAMP)?;
 
         let builder = self.request();
-        let request = encoders::encode_request_head_timestamp(builder.request_id(), contract, what_to_show, trading_hours.use_rth())?;
+        let request_id = builder.request_id();
+        let request = encoders::encode_request_head_timestamp(request_id, contract, what_to_show, trading_hours.use_rth())?;
         let subscription = builder.send_raw(request)?;
 
+        // One request, one answer: a reset is reported, never answered by a new request.
         match subscription.next() {
             Some(Ok(mut message)) if message.message_type() == IncomingMessages::HeadTimestamp => {
                 Ok(decoders::decode_head_timestamp(&mut message, self.time_zone())?)
             }
             Some(Ok(message)) => Err(Error::unexpected_response(&message)),
-            Some(Err(Error::ConnectionReset)) => self.head_timestamp(contract, what_to_show, trading_hours),
+            Some(Err(Error::ConnectionReset)) | None => Err(Error::Interrupted(request_id)),
             Some(Err(e)) => Err(e),
-            None => Err(Error::UnexpectedEndOfStream),
         }
     }
 
@@ -231,22 +232,21 @@ impl Client {
     pub fn histogram_data(&self, contract: &Contract, trading_hours: TradingHours, period: BarSize) -> Result<Vec<HistogramEntry>, Error> {
         check_version(self.server_version(), Features::HISTOGRAM)?;
 
-        loop {
-            let builder = self.request();
-            let request = encoders::encode_request_histogram_data(builder.request_id(), contract, trading_hours.use_rth(), period)?;
-            let subscription = builder.send_raw(request)?;
+        let builder = self.request();
+        let request_id = builder.request_id();
+        let request = encoders::encode_request_histogram_data(request_id, contract, trading_hours.use_rth(), period)?;
+        let subscription = builder.send_raw(request)?;
 
-            match subscription.next() {
-                Some(Ok(mut message)) => return decoders::decode_histogram_data(&mut message),
-                Some(Err(Error::ConnectionReset)) => continue,
-                Some(Err(e)) => return Err(e),
-                None => return Ok(Vec::new()),
-            }
+        // A closed channel is not an empty histogram.
+        match subscription.next() {
+            Some(Ok(mut message)) => decoders::decode_histogram_data(&mut message),
+            Some(Err(Error::ConnectionReset)) | None => Err(Error::Interrupted(request_id)),
+            Some(Err(e)) => Err(e),
         }
     }
 }
 
-pub(crate) fn time_zone(client: &Client) -> &time_tz::Tz {
+pub(crate) fn time_zone(client: &Client) -> &'static time_tz::Tz {
     if let Some(tz) = client.time_zone {
         tz
     } else {
@@ -266,45 +266,30 @@ pub(crate) fn historical_data(
 ) -> Result<HistoricalData, Error> {
     common::validate_historical_data(client.server_version(), contract, end_date, Some(what_to_show))?;
 
-    for _ in 0..MAX_RETRIES {
-        let builder = client.request();
-        let request = encoders::encode_request_historical_data(
-            builder.request_id(),
-            contract,
-            end_date,
-            duration,
-            bar_size,
-            Some(what_to_show),
-            trading_hours.use_rth(),
-            false,
-            &Vec::<crate::contracts::TagValue>::default(),
-        )?;
+    let builder = client.request();
+    let request_id = builder.request_id();
+    let request = encoders::encode_request_historical_data(
+        request_id,
+        contract,
+        end_date,
+        duration,
+        bar_size,
+        Some(what_to_show),
+        trading_hours.use_rth(),
+        false,
+        &Vec::<crate::contracts::TagValue>::default(),
+    )?;
 
-        let subscription = builder.send_raw(request)?;
+    let subscription = builder.send_raw(request)?;
 
-        match subscription.next() {
-            Some(Ok(mut message)) if message.message_type() == IncomingMessages::HistoricalData => {
-                let mut data = decoders::decode_historical_data(client.server_version, time_zone(client), &mut message)?;
-
-                if client.server_version >= crate::server_versions::HISTORICAL_DATA_END {
-                    if let Some(Ok(mut end_msg)) = subscription.next() {
-                        let (start, end) = decoders::decode_historical_data_end(client.server_version, time_zone(client), &mut end_msg)?;
-                        data.start = start;
-                        data.end = end;
-                    }
-                }
-
-                return Ok(data);
-            }
-            Some(Ok(message)) if message.message_type() == IncomingMessages::Error => return Err(Error::from(message)),
-            Some(Ok(message)) => return Err(Error::unexpected_response(&message)),
-            Some(Err(Error::ConnectionReset)) => {}
-            Some(Err(e)) => return Err(e),
-            None => return Err(Error::UnexpectedEndOfStream),
+    // A single attempt: a reset ends the call, and nothing else is sent. The
+    // answer is complete only on IB's end marker.
+    let mut answer = common::HistoricalAnswer::new(request_id, client.server_version, time_zone(client));
+    loop {
+        if let Some(result) = answer.accept(subscription.next_routed()) {
+            return result;
         }
     }
-
-    Err(Error::ConnectionReset)
 }
 
 pub(crate) fn historical_data_stream(
@@ -373,31 +358,27 @@ pub(crate) fn historical_schedule(
 ) -> Result<Schedule, Error> {
     common::validate_historical_data(client.server_version(), contract, end_date, Some(WhatToShow::Schedule))?;
 
-    loop {
-        let builder = client.request();
-        let request = encoders::encode_request_historical_data(
-            builder.request_id(),
-            contract,
-            end_date,
-            duration,
-            BarSize::Day,
-            Some(WhatToShow::Schedule),
-            true,
-            false,
-            &Vec::<crate::contracts::TagValue>::default(),
-        )?;
+    let builder = client.request();
+    let request_id = builder.request_id();
+    let request = encoders::encode_request_historical_data(
+        request_id,
+        contract,
+        end_date,
+        duration,
+        BarSize::Day,
+        Some(WhatToShow::Schedule),
+        true,
+        false,
+        &Vec::<crate::contracts::TagValue>::default(),
+    )?;
 
-        let subscription = builder.send_raw(request)?;
+    let subscription = builder.send_raw(request)?;
 
-        match subscription.next() {
-            Some(Ok(mut message)) if message.message_type() == IncomingMessages::HistoricalSchedule => {
-                return decoders::decode_historical_schedule(&mut message)
-            }
-            Some(Ok(message)) => return Err(Error::unexpected_response(&message)),
-            Some(Err(Error::ConnectionReset)) => {}
-            Some(Err(e)) => return Err(e),
-            None => return Err(Error::UnexpectedEndOfStream),
-        }
+    match subscription.next() {
+        Some(Ok(mut message)) if message.message_type() == IncomingMessages::HistoricalSchedule => decoders::decode_historical_schedule(&mut message),
+        Some(Ok(message)) => Err(Error::unexpected_response(&message)),
+        Some(Err(Error::ConnectionReset)) | None => Err(Error::Interrupted(request_id)),
+        Some(Err(e)) => Err(e),
     }
 }
 

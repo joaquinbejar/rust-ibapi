@@ -87,6 +87,21 @@ pub enum Error {
     #[error("Shutdown")]
     Shutdown,
 
+    /// The connection was closed, and this message was refused **before any
+    /// byte of it was handed to the socket**: it was not sent.
+    ///
+    /// This is the only send error that proves nothing went out. Any other
+    /// error from a write (an [`Error::Io`] above all) may have come after
+    /// some bytes, or a whole message, reached the kernel, and is ambiguous.
+    #[error("Closed: the connection is closed and the message was not sent")]
+    Closed,
+
+    /// The client's write gate refused this message, or its deadline passed,
+    /// **before any byte of it was handed to the socket**: it was not sent.
+    /// The same guarantee as [`Error::Closed`].
+    #[error("Refused: the write gate did not let the message go out: {0}")]
+    Refused(Refusal),
+
     /// Reached end of data stream.
     #[error("EndOfStream")]
     EndOfStream,
@@ -101,6 +116,33 @@ pub enum Error {
     /// Stream ended unexpectedly.
     #[error("UnexpectedEndOfStream")]
     UnexpectedEndOfStream,
+
+    /// The request's answer ended before IB completed it: its channel closed,
+    /// or the connection was reset, before the end marker (or the single
+    /// answer message) arrived. Carries IB's request id.
+    ///
+    /// Nothing was sent again: a request that ends this way is not retried
+    /// under a new id, and what arrived before the interruption is not
+    /// returned as the answer. Whether to ask again is the caller's decision.
+    #[error("Interrupted: request {0} ended before IB completed its answer")]
+    Interrupted(i32),
+
+    /// The request's answer did not complete within the caller's timeout.
+    /// Carries IB's request id.
+    ///
+    /// The request is still open at IB, which may still be serving it, until
+    /// the caller cancels it.
+    #[error("TimedOut: request {0} got no complete answer within its timeout")]
+    TimedOut(i32),
+
+    /// The subscription's channel overflowed and dropped this many messages.
+    ///
+    /// Whatever the subscription delivered before is incomplete, and an end
+    /// marker read after the loss would not make it complete, so the
+    /// subscription ends here: it yields this error once and then `None`,
+    /// and never reports `completed()`.
+    #[error("Lagged: {0} messages were dropped; the answer is incomplete")]
+    Lagged(u64),
 
     /// An IB notice frame (TWS error/warning/system message) received in
     /// response to a request. Carries the full typed [`Notice`] — code,
@@ -201,9 +243,14 @@ impl Clone for Error {
             Error::ConnectionReset => Error::ConnectionReset,
             Error::Cancelled => Error::Cancelled,
             Error::Shutdown => Error::Shutdown,
+            Error::Closed => Error::Closed,
+            Error::Refused(refusal) => Error::Refused(*refusal),
             Error::EndOfStream => Error::EndOfStream,
             Error::UnexpectedResponse(m) => Error::UnexpectedResponse(m.clone()),
             Error::UnexpectedEndOfStream => Error::UnexpectedEndOfStream,
+            Error::Interrupted(request_id) => Error::Interrupted(*request_id),
+            Error::TimedOut(request_id) => Error::TimedOut(*request_id),
+            Error::Lagged(skipped) => Error::Lagged(*skipped),
             Error::Notice(n) => Error::Notice(n.clone()),
             Error::AlreadySubscribed => Error::AlreadySubscribed,
             Error::HistoricalParseError(e) => Error::HistoricalParseError(e.clone()),
@@ -242,3 +289,63 @@ impl From<ValidationError> for Error {
 #[cfg(test)]
 #[path = "errors_tests.rs"]
 mod tests;
+
+/// Why a gate refused a message: a code the gate defines, stable, for the
+/// caller to act on, and a text for logs only. Nothing should act on the text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GateReason {
+    /// The gate's code for the reason.
+    pub code: u16,
+    /// A description, for a log.
+    pub text: &'static str,
+}
+
+impl std::fmt::Display for GateReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} (gate reason {})", self.text, self.code)
+    }
+}
+
+/// What a write was waiting for when its deadline came.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Waiting {
+    /// Nothing yet: the deadline had passed before the write began to wait.
+    Start,
+    /// The writer's lock, another write holding it.
+    Writer,
+    /// A slot: the gate had answered `Later`.
+    Slot,
+}
+
+/// Why a write was refused before any byte of it reached the socket.
+///
+/// Every refusal carries the same guarantee, whatever its cause: nothing of
+/// the message was sent. The cause is for the caller to decide what the
+/// refusal means, a deferral or not, without reading text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Refusal {
+    /// The gate refused the message.
+    Gate(GateReason),
+    /// The write's deadline passed while it waited for `waiting_for`: the
+    /// last wait it was in, across every release and retake of the lock.
+    Expired {
+        /// What it was waiting for when the deadline came.
+        waiting_for: Waiting,
+    },
+    /// The write does not wait, and another write held the writer's lock.
+    Busy,
+    /// The write does not wait, and the gate had no slot now.
+    NoSlot,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gate(reason) => write!(formatter, "the gate refused it: {reason}"),
+            Self::Expired { waiting_for } => write!(formatter, "its deadline passed waiting for {waiting_for:?}"),
+            Self::Busy => formatter.write_str("the writer was busy and the write does not wait"),
+            Self::NoSlot => formatter.write_str("no slot now, and the write does not wait"),
+        }
+    }
+}

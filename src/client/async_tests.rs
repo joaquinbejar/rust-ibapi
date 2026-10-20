@@ -188,3 +188,41 @@ async fn builder_connect_with_notice_stream_captures_handshake_notice() {
         .expect("notice stream closed");
     assert_eq!(n.code, 2104);
 }
+
+// A real close: `disconnect` ends the connection for the peer, and nothing
+// is sent after it, a subscription's cancel included.
+#[tokio::test]
+async fn disconnect_closes_the_socket_and_nothing_is_sent_after_it() {
+    let (addr, listener) = spawn_handshake_listener(handshake_frames()).await;
+    let client = Client::connect(&addr.to_string(), 100).await.expect("Client::connect");
+    let contract = Contract::stock("AAPL").build();
+    let subscription = client.market_data(&contract).subscribe().await.expect("subscribes");
+
+    client.disconnect().await;
+
+    // The listener drains until the peer's connection ends: it returns once
+    // the socket is really closed, while `client` is still alive.
+    tokio::time::timeout(std::time::Duration::from_secs(2), listener)
+        .await
+        .expect("the peer sees the connection end")
+        .expect("the listener joins");
+    let cancel = subscription.try_cancel().await;
+    assert!(matches!(cancel, Err(Error::Closed)), "{cancel:?}");
+    drop(client);
+}
+
+// The accounts the handshake listed are kept, in order, without a second
+// request.
+#[tokio::test]
+async fn the_handshakes_managed_accounts_are_kept() {
+    let mut frames = handshake_frames();
+    let accounts = frames.last_mut().expect("the managed accounts frame");
+    *accounts = binary_text(IncomingMessages::ManagedAccounts as i32, "1\0DU1111111, DU2222222,\0");
+    let (addr, _h) = spawn_handshake_listener(frames).await;
+    let client = Client::connect(&addr.to_string(), 100).await.expect("Client::connect");
+    assert_eq!(client.handshake_managed_accounts(), ["DU1111111", "DU2222222"]);
+
+    let (addr, _h) = spawn_handshake_listener(handshake_frames()).await;
+    let client = Client::connect(&addr.to_string(), 100).await.expect("Client::connect");
+    assert_eq!(client.handshake_managed_accounts(), ["DU1234567"]);
+}

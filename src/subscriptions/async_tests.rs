@@ -193,6 +193,73 @@ async fn test_subscription_next_end_of_stream() {
 }
 
 #[tokio::test]
+async fn test_completed_is_true_only_after_the_end_marker() {
+    // The end marker and a closed channel both end the stream with `None`.
+    // `completed()` is what tells them apart: a caller reading open orders or
+    // executions gets an empty result either way, and only one of the two
+    // means the broker confirmed there was nothing.
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (tx, rx) = broadcast::channel(100);
+    let internal = AsyncInternalSubscription::new(rx);
+
+    let mut subscription: Subscription<String> = Subscription::with_decoder(
+        internal,
+        message_bus,
+        |_context, _msg| Err(Error::EndOfStream),
+        None,
+        None,
+        DecoderContext::default(),
+    );
+    assert!(!subscription.completed(), "nothing has ended yet");
+
+    tx.send(ResponseMessage::from("test\0").into()).unwrap();
+    assert!(subscription.next().await.is_none());
+    assert!(subscription.completed(), "the decoder saw the end marker");
+}
+
+#[tokio::test]
+async fn test_completed_is_false_when_the_channel_closes_without_a_marker() {
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (tx, rx) = broadcast::channel::<crate::subscriptions::common::RoutedItem>(100);
+    let internal = AsyncInternalSubscription::new(rx);
+
+    let mut subscription: Subscription<String> = Subscription::with_decoder(
+        internal,
+        message_bus,
+        |_context, _msg| Err(Error::EndOfStream),
+        None,
+        None,
+        DecoderContext::default(),
+    );
+
+    // The connection goes away before the broker answers.
+    drop(tx);
+    assert!(subscription.next().await.is_none());
+    assert!(!subscription.completed(), "a closed channel was reported as the broker's own end marker");
+}
+
+#[tokio::test]
+async fn test_completed_is_false_after_a_terminal_error() {
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (tx, rx) = broadcast::channel(100);
+    let internal = AsyncInternalSubscription::new(rx);
+
+    let mut subscription: Subscription<String> = Subscription::with_decoder(
+        internal,
+        message_bus,
+        |_context, _msg| Err(Error::Simple("decode failed".to_string())),
+        None,
+        None,
+        DecoderContext::default(),
+    );
+
+    tx.send(ResponseMessage::from("test\0").into()).unwrap();
+    assert!(matches!(subscription.next().await, Some(Err(_))));
+    assert!(subscription.next().await.is_none());
+    assert!(!subscription.completed());
+}
+
+#[tokio::test]
 async fn test_subscription_no_retries_after_end_of_stream() {
     let message_bus = Arc::new(MessageBusStub::default());
     let (tx, rx) = broadcast::channel(100);
@@ -306,6 +373,92 @@ async fn test_subscription_cancel() {
 
     // Cancel again should be a no-op
     subscription.cancel().await;
+}
+
+/// `try_cancel` says whether the cancel request was written. A write that
+/// fails leaves the subscription not cancelled, so a retry sends it; once
+/// written, it is cancelled and a further call sends nothing more.
+#[tokio::test]
+async fn test_subscription_try_cancel_reports_the_write() {
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (_tx, rx) = broadcast::channel(100);
+    let internal = AsyncInternalSubscription::new(rx);
+    let cancel_fn: CancelFn =
+        Box::new(|_version, _id, _ctx| Ok(crate::messages::encode_protobuf_message(OutgoingMessages::CancelMarketData as i32, &[])));
+    let mut subscription: Subscription<String> = Subscription::with_decoder(
+        internal,
+        message_bus.clone(),
+        |_context, _msg| Ok("test".to_string()),
+        Some(321),
+        None,
+        DecoderContext::default(),
+    );
+    subscription.cancel_fn = Some(Arc::new(cancel_fn));
+
+    message_bus.set_fail_sends(true);
+    assert!(matches!(subscription.try_cancel().await, Err(Error::ConnectionReset)));
+    assert!(
+        !subscription.cancelled.load(Ordering::Relaxed),
+        "a cancel that was not written is not a cancel"
+    );
+    assert!(message_bus.request_messages().is_empty());
+
+    message_bus.set_fail_sends(false);
+    assert!(subscription.try_cancel().await.is_ok());
+    assert!(subscription.cancelled.load(Ordering::Relaxed));
+    assert_eq!(message_bus.request_messages().len(), 1, "written once");
+
+    assert!(subscription.try_cancel().await.is_ok(), "already cancelled");
+    assert_eq!(message_bus.request_messages().len(), 1, "and nothing written again");
+}
+
+/// The reviewer's case (ACS 1253): a best-effort `cancel()` whose write
+/// failed closes the subscription locally, and a later `try_cancel` must still
+/// write the cancel request rather than report the local close as sent.
+#[tokio::test]
+async fn test_try_cancel_after_a_failed_best_effort_cancel_still_writes() {
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (_tx, rx) = broadcast::channel(100);
+    let internal = AsyncInternalSubscription::new(rx);
+    let cancel_fn: CancelFn =
+        Box::new(|_version, _id, _ctx| Ok(crate::messages::encode_protobuf_message(OutgoingMessages::CancelMarketData as i32, &[])));
+    let mut subscription: Subscription<String> = Subscription::with_decoder(
+        internal,
+        message_bus.clone(),
+        |_context, _msg| Ok("test".to_string()),
+        Some(322),
+        None,
+        DecoderContext::default(),
+    );
+    subscription.cancel_fn = Some(Arc::new(cancel_fn));
+
+    message_bus.set_fail_sends(true);
+    subscription.cancel().await;
+    assert!(subscription.cancelled.load(Ordering::Relaxed), "closed locally");
+    assert!(!subscription.cancel_sent.load(Ordering::Relaxed), "but nothing was sent");
+
+    message_bus.set_fail_sends(false);
+    assert!(subscription.try_cancel().await.is_ok());
+    assert_eq!(message_bus.request_messages().len(), 1, "the cancel request is written now");
+    assert!(subscription.cancel_sent.load(Ordering::Relaxed));
+}
+
+/// A subscription with no cancel request cannot prove a cancel went out.
+#[tokio::test]
+async fn test_try_cancel_without_a_cancel_request_is_an_error() {
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (_tx, rx) = broadcast::channel(100);
+    let internal = AsyncInternalSubscription::new(rx);
+    let subscription: Subscription<String> = Subscription::with_decoder(
+        internal,
+        message_bus.clone(),
+        |_context, _msg| Ok("test".to_string()),
+        Some(323),
+        None,
+        DecoderContext::default(),
+    );
+    assert!(matches!(subscription.try_cancel().await, Err(Error::InvalidArgument(_))));
+    assert!(message_bus.request_messages().is_empty());
 }
 
 #[tokio::test]
@@ -625,4 +778,46 @@ async fn pre_decoded_subscription_polls() {
     assert!(matches!(subscription.next().await, Some(Ok(SubscriptionItem::Data(2)))));
     // After the sender drops, the stream is exhausted.
     assert!(subscription.next().await.is_none());
+}
+
+/// A decoder for the lag tests: `0` is the end marker, anything else a row.
+fn row_or_end(_context: &DecoderContext, message: &mut ResponseMessage) -> Result<String, Error> {
+    if message.peek_int(0)? == 0 {
+        Err(Error::EndOfStream)
+    } else {
+        Ok("row".to_owned())
+    }
+}
+
+#[tokio::test]
+async fn test_lag_before_the_end_marker_ends_the_subscription_not_completed() {
+    // A channel of one: the row is overwritten by the end marker before it is
+    // read. Before the fix the lag was skipped, the marker read, and the
+    // empty answer reported as completed.
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (tx, rx) = broadcast::channel(1);
+    let internal = AsyncInternalSubscription::new(rx);
+    let mut subscription: Subscription<String> = Subscription::with_decoder(internal, message_bus, row_or_end, None, None, DecoderContext::default());
+    tx.send(ResponseMessage::from("1\0").into()).unwrap();
+    tx.send(ResponseMessage::from("0\0").into()).unwrap();
+
+    let first = subscription.next().await;
+    assert!(matches!(first, Some(Err(Error::Lagged(1)))), "a lost row was not reported: {first:?}");
+    assert!(subscription.next().await.is_none(), "the subscription went on after a loss");
+    assert!(!subscription.completed(), "an answer with a lost row was reported complete");
+}
+
+#[tokio::test]
+async fn test_a_subscription_that_did_not_lag_still_completes() {
+    // The control: the same rows through a channel that holds them all.
+    let message_bus = Arc::new(MessageBusStub::default());
+    let (tx, rx) = broadcast::channel(4);
+    let internal = AsyncInternalSubscription::new(rx);
+    let mut subscription: Subscription<String> = Subscription::with_decoder(internal, message_bus, row_or_end, None, None, DecoderContext::default());
+    tx.send(ResponseMessage::from("1\0").into()).unwrap();
+    tx.send(ResponseMessage::from("0\0").into()).unwrap();
+
+    assert!(matches!(subscription.next().await, Some(Ok(SubscriptionItem::Data(_)))));
+    assert!(subscription.next().await.is_none());
+    assert!(subscription.completed());
 }

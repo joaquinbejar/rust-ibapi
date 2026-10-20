@@ -1,4 +1,5 @@
 use super::*;
+use crate::messages::IncomingMessages;
 use time::macros::{date, datetime};
 use time_tz;
 
@@ -75,12 +76,12 @@ fn test_decode_historical_data() {
 
     assert_eq!(
         historical_data.start,
-        datetime!(2023-04-13 16:31:22).assume_timezone(time_zone).unwrap(),
+        Some(datetime!(2023-04-13 16:31:22).assume_timezone(time_zone).unwrap()),
         "historical_data.start"
     );
     assert_eq!(
         historical_data.end,
-        datetime!(2023-04-15 16:31:22).assume_timezone(time_zone).unwrap(),
+        Some(datetime!(2023-04-15 16:31:22).assume_timezone(time_zone).unwrap()),
         "historical_data.end"
     );
 
@@ -90,13 +91,13 @@ fn test_decode_historical_data() {
         datetime!(2023-04-13 0:00:00 UTC),
         "historical_data.bars[0].date"
     );
-    assert_eq!(historical_data.bars[0].open, 182.94, "historical_data.bars[0].open");
-    assert_eq!(historical_data.bars[0].high, 186.50, "historical_data.bars[0].high");
-    assert_eq!(historical_data.bars[0].low, 180.94, "historical_data.bars[0].low");
-    assert_eq!(historical_data.bars[0].close, 185.90, "historical_data.bars[0].close");
-    assert_eq!(historical_data.bars[0].volume, 948837.22, "historical_data.bars[0].volume");
-    assert_eq!(historical_data.bars[0].wap, 184.869, "historical_data.bars[0].wap");
-    assert_eq!(historical_data.bars[0].count, 324891, "historical_data.bars[0].count");
+    assert_eq!(historical_data.bars[0].open, Some(182.94), "historical_data.bars[0].open");
+    assert_eq!(historical_data.bars[0].high, Some(186.50), "historical_data.bars[0].high");
+    assert_eq!(historical_data.bars[0].low, Some(180.94), "historical_data.bars[0].low");
+    assert_eq!(historical_data.bars[0].close, Some(185.90), "historical_data.bars[0].close");
+    assert_eq!(historical_data.bars[0].volume, Some(948837.22), "historical_data.bars[0].volume");
+    assert_eq!(historical_data.bars[0].wap, Some(184.869), "historical_data.bars[0].wap");
+    assert_eq!(historical_data.bars[0].count, Some(324891), "historical_data.bars[0].count");
 }
 
 #[test]
@@ -206,13 +207,13 @@ fn test_decode_historical_data_update() {
     let bar = decode_historical_data_update(time_zone, &mut message).expect("error decoding historical data update");
 
     assert_eq!(bar.date, datetime!(2023-04-10 13:30:00 UTC), "bar.date");
-    assert_eq!(bar.open, 185.50, "bar.open");
-    assert_eq!(bar.high, 186.00, "bar.high");
-    assert_eq!(bar.low, 185.00, "bar.low");
-    assert_eq!(bar.close, 185.75, "bar.close");
-    assert_eq!(bar.volume, 1000.5, "bar.volume");
-    assert_eq!(bar.wap, 185.625, "bar.wap");
-    assert_eq!(bar.count, 150, "bar.count");
+    assert_eq!(bar.open, Some(185.50), "bar.open");
+    assert_eq!(bar.high, Some(186.00), "bar.high");
+    assert_eq!(bar.low, Some(185.00), "bar.low");
+    assert_eq!(bar.close, Some(185.75), "bar.close");
+    assert_eq!(bar.volume, Some(1000.5), "bar.volume");
+    assert_eq!(bar.wap, Some(185.625), "bar.wap");
+    assert_eq!(bar.count, Some(150), "bar.count");
 }
 
 #[test]
@@ -225,13 +226,13 @@ fn test_decode_historical_data_update_without_count() {
     let bar = decode_historical_data_update(time_zone, &mut message).expect("error decoding historical data update");
 
     assert_eq!(bar.date, datetime!(2023-04-10 13:30:00 UTC), "bar.date");
-    assert_eq!(bar.open, 185.50, "bar.open");
-    assert_eq!(bar.high, 186.00, "bar.high");
-    assert_eq!(bar.low, 185.00, "bar.low");
-    assert_eq!(bar.close, 185.75, "bar.close");
-    assert_eq!(bar.volume, 1000.5, "bar.volume");
-    assert_eq!(bar.wap, 185.625, "bar.wap");
-    assert_eq!(bar.count, 0, "bar.count should default to 0 when missing");
+    assert_eq!(bar.open, Some(185.50), "bar.open");
+    assert_eq!(bar.high, Some(186.00), "bar.high");
+    assert_eq!(bar.low, Some(185.00), "bar.low");
+    assert_eq!(bar.close, Some(185.75), "bar.close");
+    assert_eq!(bar.volume, Some(1000.5), "bar.volume");
+    assert_eq!(bar.wap, Some(185.625), "bar.wap");
+    assert_eq!(bar.count, None, "an update without a count has no count, not zero");
 }
 
 #[test]
@@ -290,20 +291,20 @@ fn test_decode_historical_data_proto() {
     let mut bytes = Vec::new();
     proto_msg.encode(&mut bytes).unwrap();
 
-    let bars = decode_historical_data_proto(&bytes).unwrap();
+    let bars = decode_historical_data_proto(&bytes, time_tz::timezones::db::UTC).unwrap();
     assert_eq!(bars.len(), 2);
 
     assert_eq!(bars[0].date, datetime!(2023-04-10 13:30:00 UTC));
-    assert_eq!(bars[0].open, 185.50);
-    assert_eq!(bars[0].high, 186.00);
-    assert_eq!(bars[0].low, 185.00);
-    assert_eq!(bars[0].close, 185.75);
-    assert_eq!(bars[0].volume, 1000.0);
-    assert_eq!(bars[0].wap, 185.625);
-    assert_eq!(bars[0].count, 150);
+    assert_eq!(bars[0].open, Some(185.50));
+    assert_eq!(bars[0].high, Some(186.00));
+    assert_eq!(bars[0].low, Some(185.00));
+    assert_eq!(bars[0].close, Some(185.75));
+    assert_eq!(bars[0].volume, Some(1000.0));
+    assert_eq!(bars[0].wap, Some(185.625));
+    assert_eq!(bars[0].count, Some(150));
 
-    assert_eq!(bars[1].open, 186.00);
-    assert_eq!(bars[1].count, 300);
+    assert_eq!(bars[1].open, Some(186.00));
+    assert_eq!(bars[1].count, Some(300));
 }
 
 #[test]
@@ -531,19 +532,19 @@ fn test_decode_historical_data_update_proto() {
     let mut bytes = Vec::new();
     proto_msg.encode(&mut bytes).unwrap();
 
-    let result = decode_historical_data_update_proto(&bytes).unwrap();
-    assert_eq!(result.open, 150.0);
-    assert_eq!(result.high, 151.0);
-    assert_eq!(result.low, 149.5);
-    assert_eq!(result.close, 150.75);
-    assert_eq!(result.volume, 1000.0);
-    assert_eq!(result.wap, 150.5);
-    assert_eq!(result.count, 42);
+    let result = decode_historical_data_update_proto(&bytes, time_tz::timezones::db::UTC).unwrap();
+    assert_eq!(result.open, Some(150.0));
+    assert_eq!(result.high, Some(151.0));
+    assert_eq!(result.low, Some(149.5));
+    assert_eq!(result.close, Some(150.75));
+    assert_eq!(result.volume, Some(1000.0));
+    assert_eq!(result.wap, Some(150.5));
+    assert_eq!(result.count, Some(42));
     assert_eq!(result.date, datetime!(2023-04-10 13:30:00 UTC));
 }
 
 #[test]
-fn test_decode_historical_data_update_proto_missing_bar_defaults() {
+fn test_decode_historical_data_update_proto_missing_bar_is_an_error() {
     use prost::Message;
     let proto_msg = crate::proto::HistoricalDataUpdate {
         req_id: Some(1),
@@ -552,7 +553,188 @@ fn test_decode_historical_data_update_proto_missing_bar_defaults() {
     let mut bytes = Vec::new();
     proto_msg.encode(&mut bytes).unwrap();
 
-    let result = decode_historical_data_update_proto(&bytes).unwrap();
-    assert_eq!(result.count, 0);
-    assert_eq!(result.date, time::OffsetDateTime::UNIX_EPOCH);
+    // No bar is not a bar at UNIX_EPOCH with a count of zero.
+    let result = decode_historical_data_update_proto(&bytes, time_tz::timezones::db::UTC);
+    assert!(matches!(result, Err(Error::Parse(..))), "expected a parse error, got {result:?}");
+}
+
+// === D14 item 4: absent values stay absent ===
+
+fn text_historical_data(fields: &[&str]) -> ResponseMessage {
+    // message type, request id, one bar, then the bar's fields.
+    let mut text = String::from("17\09000\01\0");
+    for field in fields {
+        text.push_str(field);
+        text.push('\0');
+    }
+    ResponseMessage::from(text.as_str())
+}
+
+fn proto_historical_data(bar: crate::proto::HistoricalDataBar) -> ResponseMessage {
+    use prost::Message;
+    let proto_msg = crate::proto::HistoricalData {
+        req_id: Some(9000),
+        historical_data_bars: vec![bar],
+    };
+    let mut bytes = Vec::new();
+    proto_msg.encode(&mut bytes).unwrap();
+    ResponseMessage::from_protobuf(IncomingMessages::HistoricalData as i32, bytes, server_versions::PROTOBUF_HISTORICAL_DATA)
+}
+
+fn full_proto_bar() -> crate::proto::HistoricalDataBar {
+    crate::proto::HistoricalDataBar {
+        date: Some("1681133400".into()),
+        open: Some(185.50),
+        high: Some(186.00),
+        low: Some(185.00),
+        close: Some(185.75),
+        volume: Some("1000".into()),
+        wap: Some("185.625".into()),
+        bar_count: Some(150),
+    }
+}
+
+const UTC: &Tz = time_tz::timezones::db::UTC;
+
+#[test]
+fn test_text_bar_with_empty_values_keeps_them_absent() {
+    let mut message = text_historical_data(&["1681133400", "", "", "", "", "", "", ""]);
+    let data = decode_historical_data(server_versions::HISTORICAL_DATA_END, UTC, &mut message).expect("decodes");
+
+    let bar = data.bars[0];
+    assert_eq!(bar.date, datetime!(2023-04-10 13:30:00 UTC));
+    assert_eq!(
+        (bar.open, bar.high, bar.low, bar.close, bar.volume, bar.wap, bar.count),
+        (None, None, None, None, None, None, None),
+        "an empty field is a value IB did not state, never 0.0"
+    );
+}
+
+#[test]
+fn test_text_bar_keeps_stated_zero_and_negative_values() {
+    // Negative control: a stated 0 and IB's own -1 are values, not absence.
+    let mut message = text_historical_data(&["1681133400", "0", "0.0", "0", "0", "-1", "-1", "-1"]);
+    let data = decode_historical_data(server_versions::HISTORICAL_DATA_END, UTC, &mut message).expect("decodes");
+
+    let bar = data.bars[0];
+    assert_eq!(bar.open, Some(0.0));
+    assert_eq!(bar.high, Some(0.0));
+    assert_eq!(bar.close, Some(0.0));
+    assert_eq!(bar.volume, Some(-1.0));
+    assert_eq!(bar.wap, Some(-1.0));
+    assert_eq!(bar.count, Some(-1));
+}
+
+#[test]
+fn test_text_bar_with_unreadable_value_is_an_error() {
+    let mut message = text_historical_data(&["1681133400", "abc", "1", "1", "1", "1", "1", "1"]);
+    let result = decode_historical_data(server_versions::HISTORICAL_DATA_END, UTC, &mut message);
+    assert!(matches!(result, Err(Error::Parse(..))), "expected a parse error, got {result:?}");
+}
+
+#[test]
+fn test_text_bar_with_empty_or_unreadable_time_is_an_error() {
+    for date in ["", "yesterday", "99999999999999999999"] {
+        let mut message = text_historical_data(&[date, "1", "1", "1", "1", "1", "1", "1"]);
+        let result = decode_historical_data(server_versions::HISTORICAL_DATA_END, UTC, &mut message);
+        assert!(result.is_err(), "bar time {date:?} must not decode, got {result:?}");
+    }
+}
+
+#[test]
+fn test_text_update_with_empty_values_keeps_them_absent() {
+    let mut message = ResponseMessage::from("90\09000\0-1\01681133400\0\0\0\0\0\0\0\0");
+    let bar = decode_historical_data_update(UTC, &mut message).expect("decodes");
+    assert_eq!((bar.open, bar.close, bar.volume, bar.wap, bar.count), (None, None, None, None, None));
+}
+
+#[test]
+fn test_proto_bar_with_absent_values_keeps_them_absent() {
+    let mut message = proto_historical_data(crate::proto::HistoricalDataBar {
+        date: Some("1681133400".into()),
+        ..Default::default()
+    });
+    let data = decode_historical_data(server_versions::PROTOBUF_HISTORICAL_DATA, UTC, &mut message).expect("decodes");
+
+    let bar = data.bars[0];
+    assert_eq!(bar.date, datetime!(2023-04-10 13:30:00 UTC));
+    assert_eq!(
+        (bar.open, bar.high, bar.low, bar.close, bar.volume, bar.wap, bar.count),
+        (None, None, None, None, None, None, None),
+        "an absent field is a value IB did not state, never 0.0 and never -1"
+    );
+}
+
+#[test]
+fn test_proto_bar_keeps_stated_values() {
+    // Negative control: every field present, zero included, comes through as stated.
+    let mut message = proto_historical_data(crate::proto::HistoricalDataBar {
+        open: Some(0.0),
+        volume: Some("0".into()),
+        bar_count: Some(-1),
+        ..full_proto_bar()
+    });
+    let data = decode_historical_data(server_versions::PROTOBUF_HISTORICAL_DATA, UTC, &mut message).expect("decodes");
+
+    let bar = data.bars[0];
+    assert_eq!(bar.open, Some(0.0));
+    assert_eq!(bar.high, Some(186.00));
+    assert_eq!(bar.low, Some(185.00));
+    assert_eq!(bar.close, Some(185.75));
+    assert_eq!(bar.volume, Some(0.0));
+    assert_eq!(bar.wap, Some(185.625));
+    assert_eq!(bar.count, Some(-1));
+}
+
+#[test]
+fn test_proto_bar_with_unreadable_volume_is_an_error() {
+    let mut message = proto_historical_data(crate::proto::HistoricalDataBar {
+        volume: Some("lots".into()),
+        ..full_proto_bar()
+    });
+    let result = decode_historical_data(server_versions::PROTOBUF_HISTORICAL_DATA, UTC, &mut message);
+    assert!(matches!(result, Err(Error::Parse(..))), "expected a parse error, got {result:?}");
+}
+
+#[test]
+fn test_proto_bar_with_absent_or_unreadable_time_is_an_error() {
+    for date in [None, Some(""), Some("yesterday"), Some("99999999999999999999")] {
+        let mut message = proto_historical_data(crate::proto::HistoricalDataBar {
+            date: date.map(String::from),
+            ..full_proto_bar()
+        });
+        let result = decode_historical_data(server_versions::PROTOBUF_HISTORICAL_DATA, UTC, &mut message);
+        assert!(result.is_err(), "bar time {date:?} must not decode as UNIX_EPOCH, got {result:?}");
+    }
+}
+
+#[test]
+fn test_proto_daily_bar_time_reads_as_on_the_text_path() {
+    let mut message = proto_historical_data(crate::proto::HistoricalDataBar {
+        date: Some("20230413".into()),
+        ..full_proto_bar()
+    });
+    let data = decode_historical_data(server_versions::PROTOBUF_HISTORICAL_DATA, UTC, &mut message).expect("decodes");
+    assert_eq!(data.bars[0].date, datetime!(2023-04-13 0:00:00 UTC));
+}
+
+// === D14 item 1: no placeholder window ===
+
+#[test]
+fn test_data_message_alone_states_no_window_on_either_path() {
+    let mut text = text_historical_data(&["1681133400", "1", "1", "1", "1", "1", "1", "1"]);
+    let data = decode_historical_data(server_versions::HISTORICAL_DATA_END, UTC, &mut text).expect("decodes");
+    assert_eq!(
+        (data.start, data.end),
+        (None, None),
+        "text: the window is the end marker's, not now_utc()"
+    );
+
+    let mut proto = proto_historical_data(full_proto_bar());
+    let data = decode_historical_data(server_versions::PROTOBUF_HISTORICAL_DATA, UTC, &mut proto).expect("decodes");
+    assert_eq!(
+        (data.start, data.end),
+        (None, None),
+        "protobuf: the window is the end marker's, not now_utc()"
+    );
 }

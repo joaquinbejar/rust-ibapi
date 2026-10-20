@@ -8,6 +8,7 @@ use std::task::{Context, Poll};
 use futures::stream::Stream;
 use log::{debug, warn};
 use tokio::sync::mpsc;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use super::common::{filter_notice, process_decode_result, DecoderContext, ProcessingResult, RoutedItem, SubscriptionItem};
 use super::StreamDecoder;
@@ -27,7 +28,8 @@ type DecoderFn<T> = Arc<dyn Fn(&DecoderContext, &mut ResponseMessage) -> Result<
 /// * `None` — the stream has ended.
 /// * `Some(Ok(SubscriptionItem::Data(t)))` — a decoded value.
 /// * `Some(Ok(SubscriptionItem::Notice(n)))` — a non-fatal IB notice (warning code
-///   2100..=2169 or order-cancel code 202) carried on this subscription's
+///   2100..=2169, market-data information 10167 or 10090, or order-cancel code
+///   202) carried on this subscription's
 ///   `request_id`; the stream stays open.
 /// * `Some(Err(e))` — terminal error; subsequent calls return `None`.
 ///
@@ -78,9 +80,16 @@ pub struct Subscription<T> {
     context: DecoderContext,
     /// Shared across clones — one `cancel()` call disables future cancel sends from any clone.
     cancelled: Arc<AtomicBool>,
+    /// Whether a cancel request was written to the session. Not the same as
+    /// `cancelled`, which a best-effort `cancel` sets even when the write
+    /// failed: only this proves the request went out.
+    cancel_sent: Arc<AtomicBool>,
     /// Per-clone — each clone has its own `BroadcastStream` position, so a terminal event
     /// on one clone must not short-circuit other clones' polls.
     stream_ended: AtomicBool,
+    /// Per-clone — whether the stream ended because the decoder saw the broker's
+    /// own end marker, as opposed to the channel closing or an error.
+    completed: AtomicBool,
     message_bus: Option<Arc<dyn AsyncMessageBus>>,
     /// Cancel message generator
     cancel_fn: Option<Arc<CancelFn>>,
@@ -120,8 +129,10 @@ impl<T> Clone for Subscription<T> {
             order_id: self.order_id,
             context: self.context.clone(),
             cancelled: self.cancelled.clone(),
+            cancel_sent: self.cancel_sent.clone(),
             // Clone gets a fresh stream_ended — independent BroadcastStream position.
             stream_ended: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
             message_bus: self.message_bus.clone(),
             cancel_fn: self.cancel_fn.clone(),
         }
@@ -154,7 +165,9 @@ impl<T> Subscription<T> {
             order_id,
             context,
             cancelled: Arc::new(AtomicBool::new(false)),
+            cancel_sent: Arc::new(AtomicBool::new(false)),
             stream_ended: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
             message_bus: Some(message_bus),
             cancel_fn: None,
         }
@@ -201,7 +214,9 @@ impl<T> Subscription<T> {
             order_id: None,
             context: DecoderContext::default(),
             cancelled: Arc::new(AtomicBool::new(false)),
+            cancel_sent: Arc::new(AtomicBool::new(false)),
             stream_ended: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
             message_bus: None,
             cancel_fn: None,
         }
@@ -210,6 +225,23 @@ impl<T> Subscription<T> {
     /// Get the request ID associated with this subscription
     pub fn request_id(&self) -> Option<i32> {
         self.request_id
+    }
+
+    /// Whether the stream ended because the broker sent its end marker.
+    ///
+    /// Several request kinds (`reqOpenOrders`, `reqExecutions`,
+    /// `reqSecDefOptParams`, historical news) finish with a dedicated end
+    /// message that this subscription turns into the end of the stream. A
+    /// stream can also end because the channel closed or an error was
+    /// returned, and a caller that reads `None` cannot tell the two apart:
+    /// an empty result then looks the same whether the broker confirmed
+    /// there was nothing or the connection went away before it answered.
+    ///
+    /// `true` only after `next()` has returned `None` **and** the decoder saw
+    /// the end marker. `false` while the stream is still open, after a
+    /// terminal error, and after the channel closed without a marker.
+    pub fn completed(&self) -> bool {
+        self.completed.load(Ordering::Relaxed)
     }
 }
 
@@ -230,6 +262,7 @@ impl<T: Send + 'static> Stream for Subscription<T> {
             inner,
             context,
             stream_ended,
+            completed,
             ..
         } = this;
         loop {
@@ -240,7 +273,14 @@ impl<T: Send + 'static> Stream for Subscription<T> {
                     // executor between immediately-available items.
                     let routed = match Pin::new(&mut subscription.stream).poll_next(cx) {
                         Poll::Ready(Some(Ok(item))) => item,
-                        Poll::Ready(Some(Err(_lagged))) => continue, // skip BroadcastStream lag
+                        // Messages were dropped. What was delivered is not the
+                        // whole answer, and an end marker after the loss must
+                        // not make it look complete: end here, not completed.
+                        Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(skipped)))) => {
+                            warn!("subscription lagged, dropped {skipped} messages; ending it");
+                            stream_ended.store(true, Ordering::Relaxed);
+                            return Poll::Ready(Some(Err(Error::Lagged(skipped))));
+                        }
                         Poll::Ready(None) => return Poll::Ready(None),
                         Poll::Pending => return Poll::Pending,
                     };
@@ -251,6 +291,7 @@ impl<T: Send + 'static> Stream for Subscription<T> {
                             match process_decode_result(result) {
                                 ProcessingResult::Success(val) => return Poll::Ready(Some(Ok(SubscriptionItem::Data(val)))),
                                 ProcessingResult::EndOfStream => {
+                                    completed.store(true, Ordering::Relaxed);
                                     stream_ended.store(true, Ordering::Relaxed);
                                     return Poll::Ready(None);
                                 }
@@ -292,22 +333,48 @@ impl<T: Send + 'static> Stream for Subscription<T> {
 }
 
 impl<T> Subscription<T> {
-    /// Cancel the subscription
+    /// Cancel the subscription.
+    ///
+    /// Best effort: a cancel request that cannot be written is logged, and the
+    /// subscription is closed locally anyway. Use [`try_cancel`](Self::try_cancel)
+    /// to know whether a cancel request went out.
     pub async fn cancel(&self) {
         if self.cancelled.load(Ordering::Relaxed) {
             return;
         }
-
-        self.cancelled.store(true, Ordering::Relaxed);
-
-        if let (Some(message_bus), Some(cancel_fn)) = (&self.message_bus, &self.cancel_fn) {
-            let id = self.request_id.or(self.order_id);
-            if let Ok(message) = cancel_fn(self.context.server_version, id, Some(&self.context)) {
-                if let Err(e) = message_bus.send_message(message).await {
-                    warn!("error sending cancel message: {e}")
-                }
-            }
+        if let Err(e) = self.try_cancel().await {
+            warn!("error sending cancel message: {e}");
+            self.cancelled.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Cancel the subscription, and say whether a cancel request was written to
+    /// the session.
+    ///
+    /// IB acknowledges no cancellation of a market-data or streaming request,
+    /// so the written request is the last point a caller can confirm. Returns
+    /// `Ok(())` only when a cancel request was written, by this call or an
+    /// earlier one; a subscription closed locally by a best-effort
+    /// [`cancel`](Self::cancel) whose write failed is **not** a sent cancel, and
+    /// this writes it. On a write error nothing is recorded as sent, so a later
+    /// call tries again.
+    ///
+    /// # Errors
+    /// [`Error::InvalidArgument`] when this subscription has no cancel request
+    /// to send; otherwise the error of encoding or writing it.
+    pub async fn try_cancel(&self) -> Result<(), Error> {
+        if self.cancel_sent.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let (Some(message_bus), Some(cancel_fn)) = (&self.message_bus, &self.cancel_fn) else {
+            return Err(Error::InvalidArgument("this subscription has no cancel request to send".to_owned()));
+        };
+        let id = self.request_id.or(self.order_id);
+        let message = cancel_fn(self.context.server_version, id, Some(&self.context))?;
+        message_bus.send_message(message).await?;
+        self.cancel_sent.store(true, Ordering::Relaxed);
+        self.cancelled.store(true, Ordering::Relaxed);
+        Ok(())
     }
 }
 

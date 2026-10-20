@@ -7,11 +7,11 @@ use time::OffsetDateTime;
 
 use crate::client::ClientRequestBuilders;
 use crate::contracts::Contract;
-use crate::messages::IncomingMessages;
+use crate::messages::{IncomingMessages, Notice};
 use crate::protocol::{check_version, Features};
 use crate::subscriptions::r#async::Subscription;
 use crate::transport::{AsyncInternalSubscription, AsyncMessageBus};
-use crate::{Client, Error, MAX_RETRIES};
+use crate::{Client, Error};
 
 use super::common::{self, decoders, encoders};
 use super::{BarSize, Duration, HistogramEntry, HistoricalBarUpdate, HistoricalData, Schedule, TickDecoder, WhatToShow};
@@ -52,19 +52,18 @@ impl Client {
         check_version(self.server_version(), Features::HEAD_TIMESTAMP)?;
 
         let builder = self.request();
-        let request = encoders::encode_request_head_timestamp(builder.request_id(), contract, what_to_show, trading_hours.use_rth())?;
+        let request_id = builder.request_id();
+        let request = encoders::encode_request_head_timestamp(request_id, contract, what_to_show, trading_hours.use_rth())?;
         let mut subscription = builder.send_raw(request).await?;
 
+        // One request, one answer: a reset is reported, never answered by a new request.
         match subscription.next().await {
             Some(Ok(mut message)) if message.message_type() == IncomingMessages::HeadTimestamp => {
                 Ok(decoders::decode_head_timestamp(&mut message, self.time_zone())?)
             }
             Some(Ok(message)) => Err(Error::unexpected_response(&message)),
+            Some(Err(Error::ConnectionReset)) | None => Err(Error::Interrupted(request_id)),
             Some(Err(e)) => Err(e),
-            None => {
-                // Connection might have been reset, retry
-                Box::pin(self.head_timestamp(contract, what_to_show, trading_hours)).await
-            }
         }
     }
 
@@ -253,21 +252,20 @@ impl Client {
     pub async fn histogram_data(&self, contract: &Contract, trading_hours: TradingHours, period: BarSize) -> Result<Vec<HistogramEntry>, Error> {
         check_version(self.server_version(), Features::HISTOGRAM)?;
 
-        loop {
-            let builder = self.request();
-            let request = encoders::encode_request_histogram_data(builder.request_id(), contract, trading_hours.use_rth(), period)?;
-            let mut subscription = builder.send_raw(request).await?;
+        let builder = self.request();
+        let request_id = builder.request_id();
+        let request = encoders::encode_request_histogram_data(request_id, contract, trading_hours.use_rth(), period)?;
+        let mut subscription = builder.send_raw(request).await?;
 
-            match subscription.next().await {
-                Some(Ok(mut message)) => return decoders::decode_histogram_data(&mut message),
-                Some(Err(e)) => return Err(e),
-                None => continue, // Connection reset, retry
-            }
+        match subscription.next().await {
+            Some(Ok(mut message)) => decoders::decode_histogram_data(&mut message),
+            Some(Err(Error::ConnectionReset)) | None => Err(Error::Interrupted(request_id)),
+            Some(Err(e)) => Err(e),
         }
     }
 }
 
-pub(crate) fn time_zone(client: &Client) -> &time_tz::Tz {
+pub(crate) fn time_zone(client: &Client) -> &'static time_tz::Tz {
     if let Some(tz) = client.time_zone {
         tz
     } else {
@@ -276,6 +274,7 @@ pub(crate) fn time_zone(client: &Client) -> &time_tz::Tz {
     }
 }
 
+/// Send one historical bar request and return its handle.
 pub(crate) async fn historical_data(
     client: &Client,
     contract: &Contract,
@@ -284,47 +283,248 @@ pub(crate) async fn historical_data(
     bar_size: BarSize,
     what_to_show: WhatToShow,
     trading_hours: TradingHours,
-) -> Result<HistoricalData, Error> {
+) -> Result<HistoricalDataRequest, Error> {
     common::validate_historical_data(client.server_version(), contract, end_date, Some(what_to_show))?;
 
-    for _ in 0..MAX_RETRIES {
-        let builder = client.request();
-        let request = encoders::encode_request_historical_data(
-            builder.request_id(),
-            contract,
-            end_date,
-            duration,
-            bar_size,
-            Some(what_to_show),
-            trading_hours.use_rth(),
-            false,
-            &Vec::<crate::contracts::TagValue>::default(),
-        )?;
+    let builder = client.request();
+    let request_id = builder.request_id();
+    let request = encoders::encode_request_historical_data(
+        request_id,
+        contract,
+        end_date,
+        duration,
+        bar_size,
+        Some(what_to_show),
+        trading_hours.use_rth(),
+        false,
+        &Vec::<crate::contracts::TagValue>::default(),
+    )?;
 
-        let mut subscription = builder.send_raw(request).await?;
+    let subscription = builder.send_raw(request).await?;
 
-        match subscription.next().await {
-            Some(Ok(mut message)) if message.message_type() == IncomingMessages::HistoricalData => {
-                let mut data = decoders::decode_historical_data(client.server_version(), time_zone(client), &mut message)?;
+    Ok(HistoricalDataRequest {
+        request_id,
+        subscription,
+        message_bus: Arc::clone(&client.message_bus),
+        answer: common::HistoricalAnswer::new(request_id, client.server_version(), time_zone(client)),
+        state: RequestState::Open,
+        ended: None,
+    })
+}
 
-                if client.server_version() >= crate::server_versions::HISTORICAL_DATA_END {
-                    if let Some(Ok(mut end_msg)) = subscription.next().await {
-                        let (start, end) = decoders::decode_historical_data_end(client.server_version(), time_zone(client), &mut end_msg)?;
-                        data.start = start;
-                        data.end = end;
-                    }
+// === HistoricalDataRequest ===
+
+/// Where a [`HistoricalDataRequest`] stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestState {
+    /// Sent, and neither ended by IB nor cancelled: IB may still be serving
+    /// it, even after a local error ended the answer.
+    Open,
+    /// Not live at IB: IB ended it (its end marker, or a code that ends the
+    /// request), or the session it was sent on is gone (interrupted).
+    Ended,
+    /// A cancel request was written for it.
+    Cancelled,
+}
+
+/// One historical bar request in flight: its IB request id, its answer, and
+/// its cancellation.
+///
+/// Returned by [`HistoricalDataBuilder::send`](super::HistoricalDataBuilder::send).
+/// The request was written when this handle was returned; nothing else is
+/// ever sent for it except a cancel, and it is never retried.
+///
+/// - [`request_id`](Self::request_id) is IB's id for it, the one every answer,
+///   error and notice for it carries.
+/// - [`answer`](Self::answer) waits for the answer, which is complete only on
+///   IB's end marker. It is cancel-safe: a caller can bound it with its own
+///   timer, and what arrived so far is kept for the next call.
+/// - [`answer_within`](Self::answer_within) is the same with a per-call
+///   timeout. A timeout leaves the request open at IB: call
+///   [`cancel`](Self::cancel) to end it there.
+/// - [`cancel`](Self::cancel) writes `cancelHistoricalData` for this id and
+///   says whether it was written.
+///
+/// Dropping an open handle (not ended by IB, not cancelled) sends the cancel on a
+/// spawned task, as [`Subscription`](crate::subscriptions::Subscription)
+/// does; call [`cancel`](Self::cancel) to know whether it went out.
+#[must_use = "HistoricalDataRequest must be answered or cancelled; dropping it while open cancels the request"]
+pub struct HistoricalDataRequest {
+    request_id: i32,
+    subscription: AsyncInternalSubscription,
+    message_bus: Arc<dyn AsyncMessageBus>,
+    answer: common::HistoricalAnswer,
+    state: RequestState,
+    ended: Option<Result<HistoricalData, Error>>,
+}
+
+impl HistoricalDataRequest {
+    /// IB's request id for this request.
+    pub fn request_id(&self) -> i32 {
+        self.request_id
+    }
+
+    /// Whether the request may still be live at IB: sent, not ended by IB,
+    /// its session not lost, not cancelled. A local error that ended
+    /// [`answer`](Self::answer) (a lagged channel, an undecodable or
+    /// unexpected message) leaves it open.
+    pub fn is_open(&self) -> bool {
+        self.state == RequestState::Open
+    }
+
+    /// Every error and notice IB sent for this request so far, in the order
+    /// they arrived, each with IB's code and text; the one that ended it, if
+    /// IB ended it with an error, included. Readable after a timeout or an
+    /// error, when there is no [`HistoricalData`] to carry them.
+    pub fn notices(&self) -> &[Notice] {
+        self.answer.notices()
+    }
+
+    /// Wait for the answer.
+    ///
+    /// `Ok` only once IB's end marker arrived, with the bars and IB's window.
+    /// A channel that closes or resets first is [`Error::Interrupted`]; an IB
+    /// error for this request is [`Error::Notice`] with its code and text; a
+    /// cancelled request is [`Error::Cancelled`]. Once ended, every later call
+    /// returns the same result.
+    ///
+    /// Cancel-safe: dropping this future (a timer around it, a `select!`)
+    /// loses nothing that already arrived.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::prelude::*;
+    ///
+    /// #[tokio::main]
+    /// async fn main() {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await.expect("connection failed");
+    ///     let contract = Contract::stock("AAPL").build();
+    ///
+    ///     let mut request = client
+    ///         .historical_data(&contract, HistoricalBarSize::Min)
+    ///         .duration(1.days())
+    ///         .send()
+    ///         .await
+    ///         .expect("request not sent");
+    ///     println!("request id {}", request.request_id());
+    ///
+    ///     let data = request.answer().await.expect("no complete answer");
+    ///     println!("{} bars from {:?} to {:?}", data.bars.len(), data.start, data.end);
+    /// }
+    /// ```
+    pub async fn answer(&mut self) -> Result<HistoricalData, Error> {
+        if let Some(ended) = &self.ended {
+            return ended.clone();
+        }
+        if self.state == RequestState::Cancelled {
+            return Err(Error::Cancelled);
+        }
+        loop {
+            let item = self.subscription.next_item().await;
+            if let Some(result) = self.answer.accept(item) {
+                // A local end (lagged channel, undecodable or unexpected
+                // message) proves nothing about IB: the request stays open, so
+                // cancel() and Drop still write the cancel.
+                if !self.answer.may_be_live_at_ib() {
+                    self.state = RequestState::Ended;
                 }
-
-                return Ok(data);
+                self.ended = Some(result.clone());
+                return result;
             }
-            Some(Ok(message)) if message.message_type() == IncomingMessages::Error => return Err(Error::from(message)),
-            Some(Ok(message)) => return Err(Error::unexpected_response(&message)),
-            Some(Err(e)) => return Err(e),
-            None => continue, // Connection reset, retry
         }
     }
 
-    Err(Error::ConnectionReset)
+    /// Wait for the answer for at most `timeout`.
+    ///
+    /// As [`answer`](Self::answer); when `timeout` passes first, returns
+    /// [`Error::TimedOut`] with this request's id and leaves the request open:
+    /// IB may still be serving it. Call [`cancel`](Self::cancel) to end it at
+    /// IB, or `answer` again to keep waiting with what arrived so far.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::time::Duration as StdDuration;
+    /// use ibapi::prelude::*;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), ibapi::Error> {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await?;
+    ///     let contract = Contract::stock("AAPL").build();
+    ///
+    ///     let mut request = client.historical_data(&contract, HistoricalBarSize::Min).duration(1.days()).send().await?;
+    ///     match request.answer_within(StdDuration::from_secs(30)).await {
+    ///         Ok(data) => println!("{} bars", data.bars.len()),
+    ///         Err(ibapi::Error::TimedOut(request_id)) => {
+    ///             request.cancel().await?;
+    ///             println!("request {request_id} timed out and was cancelled");
+    ///         }
+    ///         Err(e) => return Err(e),
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn answer_within(&mut self, timeout: std::time::Duration) -> Result<HistoricalData, Error> {
+        match tokio::time::timeout(timeout, self.answer()).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(Error::TimedOut(self.request_id)),
+        }
+    }
+
+    /// Cancel the request at IB: write `cancelHistoricalData` for its id.
+    ///
+    /// `Ok(())` when the cancel was written, by this call or an earlier one,
+    /// and when there is nothing to cancel: IB already ended the request (its
+    /// end marker, or a code that ends it), or its session is gone
+    /// ([`Error::Interrupted`]). After a local error (a lagged channel, an
+    /// undecodable message) the cancel is written.
+    /// On a write error the request stays open (a later call tries again), and
+    /// the error says what happened: only [`Error::Closed`] and
+    /// [`Error::Refused`] prove nothing was written.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ibapi::prelude::*;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), ibapi::Error> {
+    ///     let client = Client::connect("127.0.0.1:4002", 100).await?;
+    ///     let contract = Contract::stock("AAPL").build();
+    ///
+    ///     let mut request = client.historical_data(&contract, HistoricalBarSize::Min).duration(1.days()).send().await?;
+    ///     request.cancel().await?;
+    ///     assert!(!request.is_open());
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn cancel(&mut self) -> Result<(), Error> {
+        if self.state != RequestState::Open {
+            return Ok(());
+        }
+        let message = encoders::encode_cancel_historical_data(self.request_id)?;
+        self.message_bus.cancel_subscription(self.request_id, message).await?;
+        self.state = RequestState::Cancelled;
+        Ok(())
+    }
+}
+
+impl Drop for HistoricalDataRequest {
+    fn drop(&mut self) {
+        if self.state != RequestState::Open {
+            return;
+        }
+        let request_id = self.request_id;
+        let message_bus = Arc::clone(&self.message_bus);
+        if let Ok(message) = encoders::encode_cancel_historical_data(request_id) {
+            tokio::spawn(async move {
+                if let Err(e) = message_bus.cancel_subscription(request_id, message).await {
+                    warn!("error sending cancel historical data in drop: {e}");
+                }
+            });
+        }
+    }
 }
 
 pub(crate) async fn historical_data_stream(
@@ -393,30 +593,27 @@ pub(crate) async fn historical_schedule(
 ) -> Result<Schedule, Error> {
     common::validate_historical_data(client.server_version(), contract, end_date, Some(WhatToShow::Schedule))?;
 
-    loop {
-        let builder = client.request();
-        let request = encoders::encode_request_historical_data(
-            builder.request_id(),
-            contract,
-            end_date,
-            duration,
-            BarSize::Day,
-            Some(WhatToShow::Schedule),
-            true,
-            false,
-            &Vec::<crate::contracts::TagValue>::default(),
-        )?;
+    let builder = client.request();
+    let request_id = builder.request_id();
+    let request = encoders::encode_request_historical_data(
+        request_id,
+        contract,
+        end_date,
+        duration,
+        BarSize::Day,
+        Some(WhatToShow::Schedule),
+        true,
+        false,
+        &Vec::<crate::contracts::TagValue>::default(),
+    )?;
 
-        let mut subscription = builder.send_raw(request).await?;
+    let mut subscription = builder.send_raw(request).await?;
 
-        match subscription.next().await {
-            Some(Ok(mut message)) if message.message_type() == IncomingMessages::HistoricalSchedule => {
-                return decoders::decode_historical_schedule(&mut message)
-            }
-            Some(Ok(message)) => return Err(Error::unexpected_response(&message)),
-            Some(Err(e)) => return Err(e),
-            None => continue, // Connection reset, retry
-        }
+    match subscription.next().await {
+        Some(Ok(mut message)) if message.message_type() == IncomingMessages::HistoricalSchedule => decoders::decode_historical_schedule(&mut message),
+        Some(Ok(message)) => Err(Error::unexpected_response(&message)),
+        Some(Err(Error::ConnectionReset)) | None => Err(Error::Interrupted(request_id)),
+        Some(Err(e)) => Err(e),
     }
 }
 

@@ -170,25 +170,25 @@ async fn test_historical_data() {
     let bar = &data.bars[0];
     // 1678886400 = 2023-03-15 13:20:00 UTC
     assert_eq!(bar.date, datetime!(2023-03-15 13:20:00 UTC), "Wrong date for first bar");
-    assert_eq!(bar.open, 185.50, "Wrong open for first bar");
-    assert_eq!(bar.high, 186.00, "Wrong high for first bar");
-    assert_eq!(bar.low, 185.25, "Wrong low for first bar");
-    assert_eq!(bar.close, 185.75, "Wrong close for first bar");
-    assert_eq!(bar.volume, 1000.0, "Wrong volume for first bar");
-    assert_eq!(bar.wap, 185.70, "Wrong WAP for first bar");
-    assert_eq!(bar.count, 100, "Wrong count for first bar");
+    assert_eq!(bar.open, Some(185.50), "Wrong open for first bar");
+    assert_eq!(bar.high, Some(186.00), "Wrong high for first bar");
+    assert_eq!(bar.low, Some(185.25), "Wrong low for first bar");
+    assert_eq!(bar.close, Some(185.75), "Wrong close for first bar");
+    assert_eq!(bar.volume, Some(1000.0), "Wrong volume for first bar");
+    assert_eq!(bar.wap, Some(185.70), "Wrong WAP for first bar");
+    assert_eq!(bar.count, Some(100), "Wrong count for first bar");
 
     // Verify second bar
     let bar = &data.bars[1];
     // 1678890000 = 2023-03-15 14:20:00 UTC
     assert_eq!(bar.date, datetime!(2023-03-15 14:20:00 UTC), "Wrong date for second bar");
-    assert_eq!(bar.open, 185.75, "Wrong open for second bar");
-    assert_eq!(bar.high, 186.25, "Wrong high for second bar");
-    assert_eq!(bar.low, 185.50, "Wrong low for second bar");
-    assert_eq!(bar.close, 186.00, "Wrong close for second bar");
-    assert_eq!(bar.volume, 1500.0, "Wrong volume for second bar");
-    assert_eq!(bar.wap, 185.85, "Wrong WAP for second bar");
-    assert_eq!(bar.count, 150, "Wrong count for second bar");
+    assert_eq!(bar.open, Some(185.75), "Wrong open for second bar");
+    assert_eq!(bar.high, Some(186.25), "Wrong high for second bar");
+    assert_eq!(bar.low, Some(185.50), "Wrong low for second bar");
+    assert_eq!(bar.close, Some(186.00), "Wrong close for second bar");
+    assert_eq!(bar.volume, Some(1500.0), "Wrong volume for second bar");
+    assert_eq!(bar.wap, Some(185.85), "Wrong WAP for second bar");
+    assert_eq!(bar.count, Some(150), "Wrong count for second bar");
 
     assert_eq!(request_message_count(&message_bus), 1);
     assert_request(
@@ -598,15 +598,15 @@ async fn test_historical_data_streaming_with_updates() {
         panic!("Expected Historical variant");
     };
     assert_eq!(data.bars.len(), 1, "Should have 1 initial bar");
-    assert_eq!(data.bars[0].open, 185.50, "Wrong open price");
+    assert_eq!(data.bars[0].open, Some(185.50), "Wrong open price");
 
     // Second: receive streaming update
     let Some(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Update(bar)))) = subscription.next().await else {
         panic!("Expected Update variant");
     };
-    assert_eq!(bar.open, 185.80, "Wrong open price in update");
-    assert_eq!(bar.high, 186.10, "Wrong high price in update");
-    assert_eq!(bar.close, 185.90, "Wrong close price in update");
+    assert_eq!(bar.open, Some(185.80), "Wrong open price in update");
+    assert_eq!(bar.high, Some(186.10), "Wrong high price in update");
+    assert_eq!(bar.close, Some(185.90), "Wrong close price in update");
 
     assert_eq!(request_message_count(&message_bus), 1);
     assert_request(
@@ -824,14 +824,15 @@ async fn test_historical_data_with_end_message() {
         .expect("historical_data should succeed");
 
     assert_eq!(data.bars.len(), 1, "should have one bar");
-    assert_eq!(data.start, datetime!(2023-03-15 09:30:00 UTC), "start populated from end-message");
-    assert_eq!(data.end, datetime!(2023-03-15 10:30:00 UTC), "end populated from end-message");
+    assert_eq!(data.start, Some(datetime!(2023-03-15 09:30:00 UTC)), "start populated from end-message");
+    assert_eq!(data.end, Some(datetime!(2023-03-15 10:30:00 UTC)), "end populated from end-message");
 }
 
 #[tokio::test]
-async fn test_historical_data_connection_reset_after_retries() {
-    // Empty responses → broadcast channel closes immediately → subscription.next()
-    // returns None on every retry → loop exhausts MAX_RETRIES and returns ConnectionReset.
+async fn test_historical_data_interrupted_is_not_retried() {
+    // Empty responses → broadcast channel closes immediately. The single
+    // attempt ends Interrupted with its request id, and nothing else is sent
+    // (this sent five requests under five ids before).
     let message_bus = Arc::new(MessageBusStub::default());
     let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
 
@@ -841,9 +842,54 @@ async fn test_historical_data_connection_reset_after_retries() {
         .fetch()
         .await;
 
-    assert!(matches!(result, Err(Error::ConnectionReset)), "expected ConnectionReset, got {result:?}");
-    // Each retry resends the request — MAX_RETRIES = 5.
-    assert_eq!(request_message_count(&message_bus), 5, "should retry MAX_RETRIES times");
+    assert!(
+        matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+        "expected Interrupted, got {result:?}"
+    );
+    assert_eq!(request_message_count(&message_bus), 1, "an interrupted request is not sent again");
+}
+
+#[tokio::test]
+async fn test_head_timestamp_interrupted_is_not_retried() {
+    // This recursed into a new request, without bound, on every closed channel.
+    let message_bus = Arc::new(MessageBusStub::default());
+    let client = Client::stubbed(message_bus.clone(), server_versions::BOND_ISSUERID);
+
+    let result = client.head_timestamp(&test_contract(), WhatToShow::Trades, TradingHours::Regular).await;
+
+    assert!(
+        matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+        "expected Interrupted, got {result:?}"
+    );
+    assert_eq!(request_message_count(&message_bus), 1, "an interrupted request is not sent again");
+}
+
+#[tokio::test]
+async fn test_histogram_data_interrupted_is_not_retried() {
+    let message_bus = Arc::new(MessageBusStub::default());
+    let client = Client::stubbed(message_bus.clone(), server_versions::SIZE_RULES);
+
+    let result = client.histogram_data(&test_contract(), TradingHours::Regular, BarSize::Day).await;
+
+    assert!(
+        matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+        "expected Interrupted, got {result:?}"
+    );
+    assert_eq!(request_message_count(&message_bus), 1, "an interrupted request is not sent again");
+}
+
+#[tokio::test]
+async fn test_historical_schedules_interrupted_is_not_retried() {
+    let message_bus = Arc::new(MessageBusStub::default());
+    let client = Client::stubbed(message_bus.clone(), server_versions::HISTORICAL_SCHEDULE);
+
+    let result = client.historical_schedules(&test_contract(), Duration::days(1)).fetch().await;
+
+    assert!(
+        matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+        "expected Interrupted, got {result:?}"
+    );
+    assert_eq!(request_message_count(&message_bus), 1, "an interrupted request is not sent again");
 }
 
 #[tokio::test]
@@ -1003,4 +1049,577 @@ async fn test_tick_subscription_returns_none_on_closed_channel() {
         .expect("subscription should be created");
 
     assert!(subscription.next().await.is_none(), "closed channel yields None");
+}
+
+// === D14 item 1: the end marker is required ===
+
+mod end_marker {
+    use super::*;
+    use crate::common::test_utils::helpers::proto_response;
+    use crate::messages::IncomingMessages;
+    use crate::testdata::builders::market_data::{full_historical_bar, HistoricalDataEndResponse, HistoricalDataResponse};
+    use crate::testdata::builders::ResponseProtoEncoder;
+
+    async fn fetch(message_bus: Arc<MessageBusStub>, server_version: i32) -> Result<HistoricalData, Error> {
+        let mut client = Client::stubbed(message_bus, server_version);
+        client.time_zone = Some(time_tz::timezones::db::UTC);
+        client
+            .historical_data(&test_contract(), BarSize::Hour)
+            .duration(Duration::days(1))
+            .fetch()
+            .await
+    }
+
+    fn proto_data() -> crate::messages::ResponseMessage {
+        proto_response(
+            IncomingMessages::HistoricalData,
+            HistoricalDataResponse::default().bar(full_historical_bar()).encode_proto(),
+        )
+    }
+
+    fn proto_end() -> crate::messages::ResponseMessage {
+        proto_response(IncomingMessages::HistoricalDataEnd, HistoricalDataEndResponse::default().encode_proto())
+    }
+
+    #[tokio::test]
+    async fn text_answer_without_end_marker_is_interrupted() {
+        // The bars arrive, then the channel closes before HistoricalDataEnd.
+        // This returned Ok(bars) with a window of now_utc() before.
+        let message_bus = Arc::new(MessageBusStub::with_responses(vec![
+            "17|9000|1|1678886400|185.50|186.00|185.25|185.75|1000|185.70|100|".to_owned(),
+        ]));
+
+        let result = fetch(message_bus.clone(), server_versions::HISTORICAL_DATA_END).await;
+
+        assert!(
+            matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+            "expected Interrupted, got {result:?}"
+        );
+        assert_eq!(request_message_count(&message_bus), 1);
+    }
+
+    #[tokio::test]
+    async fn proto_answer_without_end_marker_is_interrupted() {
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_data()]));
+
+        let result = fetch(message_bus.clone(), server_versions::PROTOBUF_HISTORICAL_DATA).await;
+
+        assert!(
+            matches!(result, Err(Error::Interrupted(TEST_REQ_ID_FIRST))),
+            "expected Interrupted, got {result:?}"
+        );
+        assert_eq!(request_message_count(&message_bus), 1);
+    }
+
+    #[tokio::test]
+    async fn proto_answer_with_end_marker_is_complete_with_ibs_window() {
+        // Negative control for the two above: the same answer with its marker.
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_data(), proto_end()]));
+
+        let data = fetch(message_bus, server_versions::PROTOBUF_HISTORICAL_DATA)
+            .await
+            .expect("complete answer");
+
+        assert_eq!(data.bars.len(), 1);
+        assert_eq!(data.bars[0].close, Some(185.75));
+        assert_eq!(data.start, Some(datetime!(2023-03-15 09:30:00 UTC)), "start from the end marker");
+        assert_eq!(data.end, Some(datetime!(2023-03-15 10:30:00 UTC)), "end from the end marker");
+    }
+
+    #[tokio::test]
+    async fn end_marker_before_any_data_is_not_an_answer() {
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_end()]));
+
+        let result = fetch(message_bus, server_versions::PROTOBUF_HISTORICAL_DATA).await;
+
+        assert!(matches!(result, Err(Error::UnexpectedResponse(_))), "got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn stream_initial_batch_has_no_placeholder_window() {
+        // The streaming variant decodes the same data message: its window is
+        // unknown until IB states it, never now_utc().
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(vec![proto_data()]));
+        let client = Client::stubbed(message_bus, server_versions::PROTOBUF_HISTORICAL_DATA);
+
+        let mut subscription = client
+            .historical_data(&test_contract(), BarSize::Hour)
+            .duration(Duration::days(1))
+            .stream()
+            .await
+            .expect("stream");
+
+        match subscription.next().await {
+            Some(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Historical(data)))) => {
+                assert_eq!((data.start, data.end), (None, None));
+                assert_eq!(data.bars.len(), 1);
+            }
+            other => panic!("expected the initial batch, got {other:?}"),
+        }
+    }
+}
+
+// === D14 item 3: request id, cancel and a per-call timeout ===
+
+mod request_handle {
+    use super::*;
+    use crate::common::test_utils::helpers::{decode_request_proto, proto_response};
+    use crate::messages::IncomingMessages;
+    use crate::testdata::builders::market_data::{full_historical_bar, HistoricalDataEndResponse, HistoricalDataResponse};
+    use crate::testdata::builders::ResponseProtoEncoder;
+    use crate::transport::AsyncInternalSubscription;
+    use std::time::Duration as StdDuration;
+    use tokio::sync::broadcast;
+
+    /// A request whose channel stays open until the test drops the sender, as
+    /// a Gateway that is slow to answer.
+    fn open_request(message_bus: Arc<MessageBusStub>) -> (broadcast::Sender<RoutedItem>, HistoricalDataRequest) {
+        let (sender, receiver) = broadcast::channel(16);
+        let request = HistoricalDataRequest {
+            request_id: TEST_REQ_ID_FIRST,
+            subscription: AsyncInternalSubscription::new(receiver),
+            message_bus,
+            answer: common::HistoricalAnswer::new(TEST_REQ_ID_FIRST, server_versions::PROTOBUF_HISTORICAL_DATA, time_tz::timezones::db::UTC),
+            state: RequestState::Open,
+            ended: None,
+        };
+        (sender, request)
+    }
+
+    fn proto_data() -> RoutedItem {
+        proto_response(
+            IncomingMessages::HistoricalData,
+            HistoricalDataResponse::default().bar(full_historical_bar()).encode_proto(),
+        )
+        .into()
+    }
+
+    fn proto_end() -> RoutedItem {
+        proto_response(IncomingMessages::HistoricalDataEnd, HistoricalDataEndResponse::default().encode_proto()).into()
+    }
+
+    fn cancels(message_bus: &MessageBusStub) -> usize {
+        count_proto_msgs(&message_bus.request_messages.read().unwrap(), OutgoingMessages::CancelHistoricalData)
+    }
+
+    #[tokio::test]
+    async fn send_exposes_the_request_id_it_wrote() {
+        let message_bus = Arc::new(MessageBusStub::default());
+        let client = Client::stubbed(message_bus.clone(), server_versions::PROTOBUF_HISTORICAL_DATA);
+
+        let request = client
+            .historical_data(&test_contract(), BarSize::Hour)
+            .duration(Duration::days(1))
+            .send()
+            .await
+            .expect("sent");
+
+        assert_eq!(request.request_id(), TEST_REQ_ID_FIRST);
+        let written: crate::proto::HistoricalDataRequest = decode_request_proto(&message_bus, 0);
+        assert_eq!(written.req_id, Some(request.request_id()), "the id exposed is the id written");
+    }
+
+    #[tokio::test]
+    async fn slow_answer_times_out_and_is_cancelled_by_its_id() {
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (sender, mut request) = open_request(message_bus.clone());
+        sender.send(proto_data()).unwrap();
+
+        // The bars arrived, the end marker did not: the per-call timeout fires.
+        let result = request.answer_within(StdDuration::from_millis(20)).await;
+        assert!(
+            matches!(result, Err(Error::TimedOut(TEST_REQ_ID_FIRST))),
+            "expected TimedOut, got {result:?}"
+        );
+        assert!(request.is_open(), "a timeout leaves the request open at IB");
+        assert_eq!(cancels(&message_bus), 0, "a timeout alone writes nothing");
+
+        request.cancel().await.expect("cancel written");
+        assert!(!request.is_open());
+        assert_eq!(cancels(&message_bus), 1);
+        let cancel: crate::proto::CancelHistoricalData = decode_request_proto(&message_bus, 0);
+        assert_eq!(cancel.req_id, Some(TEST_REQ_ID_FIRST), "the cancel names this request");
+
+        // Cancelled is terminal and idempotent: no second cancel, no answer.
+        request.cancel().await.expect("idempotent");
+        assert_eq!(cancels(&message_bus), 1);
+        assert!(matches!(request.answer().await, Err(Error::Cancelled)));
+        drop(request);
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+        assert_eq!(cancels(&message_bus), 1, "a cancelled request sends no cancel on drop");
+    }
+
+    #[tokio::test]
+    async fn answer_after_a_timeout_keeps_what_arrived() {
+        // Negative control for the timeout: the end marker arrives late, and
+        // the answer is complete with the bars that came before the timeout.
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (sender, mut request) = open_request(message_bus.clone());
+        sender.send(proto_data()).unwrap();
+
+        assert!(matches!(
+            request.answer_within(StdDuration::from_millis(20)).await,
+            Err(Error::TimedOut(_))
+        ));
+        sender.send(proto_end()).unwrap();
+
+        let data = request.answer_within(StdDuration::from_secs(5)).await.expect("complete answer");
+        assert_eq!(data.bars.len(), 1, "the bar received before the timeout is kept");
+        assert_eq!(data.end, Some(datetime!(2023-03-15 10:30:00 UTC)));
+        assert!(!request.is_open());
+
+        // Ended by IB: nothing to cancel, now or on drop.
+        request.cancel().await.expect("nothing to cancel");
+        drop(request);
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+        assert_eq!(cancels(&message_bus), 0);
+    }
+
+    #[tokio::test]
+    async fn ended_answer_is_repeated() {
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (sender, mut request) = open_request(message_bus);
+        sender.send(proto_data()).unwrap();
+        sender.send(proto_end()).unwrap();
+
+        let first = request.answer().await.expect("complete");
+        let second = request.answer().await.expect("same answer");
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn cancel_that_cannot_be_written_leaves_the_request_open() {
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (_sender, mut request) = open_request(message_bus.clone());
+        message_bus.set_fail_sends(true);
+
+        let result = request.cancel().await;
+        assert!(result.is_err(), "the write error is reported");
+        assert!(request.is_open(), "an unwritten cancel does not close the request");
+
+        message_bus.set_fail_sends(false);
+        request.cancel().await.expect("written on retry");
+        assert_eq!(cancels(&message_bus), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_an_open_request_cancels_it() {
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (_sender, request) = open_request(message_bus.clone());
+
+        drop(request);
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+
+        assert_eq!(cancels(&message_bus), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_writes_no_cancel_after_a_complete_answer() {
+        // Text path: a complete answer through fetch() leaves nothing to cancel.
+        let message_bus = Arc::new(MessageBusStub::with_responses(vec![
+            "17|9000|1|1678886400|185.50|186.00|185.25|185.75|1000|185.70|100|".to_owned(),
+            "108|9000|20230315 09:30:00 UTC|20230315 10:30:00 UTC|".to_owned(),
+        ]));
+        let mut client = Client::stubbed(message_bus.clone(), server_versions::HISTORICAL_DATA_END);
+        client.time_zone = Some(time_tz::timezones::db::UTC);
+
+        client
+            .historical_data(&test_contract(), BarSize::Hour)
+            .duration(Duration::days(1))
+            .fetch()
+            .await
+            .expect("complete");
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+
+        assert_eq!(request_message_count(&message_bus), 1, "the request only, no cancel");
+    }
+}
+
+// === D14 item 5: IB's codes reach the caller with their text ===
+
+mod codes {
+    use super::*;
+    use crate::common::test_utils::helpers::{proto_response, text_response};
+    use crate::messages::{IncomingMessages, Notice};
+    use crate::testdata::builders::market_data::{full_historical_bar, HistoricalDataEndResponse, HistoricalDataResponse};
+    use crate::testdata::builders::ResponseProtoEncoder;
+    use crate::transport::AsyncInternalSubscription;
+    use prost::Message;
+    use tokio::sync::broadcast;
+
+    const PACING: &str = "Historical Market Data Service error message:Historical data request pacing violation";
+    const COMPETING: &str = "No market data during competing live session";
+    const NO_TIME_ZONE: &str = "Warning: You submitted request with date-time attributes without explicit time zone.";
+
+    fn proto_data() -> crate::messages::ResponseMessage {
+        proto_response(
+            IncomingMessages::HistoricalData,
+            HistoricalDataResponse::default().bar(full_historical_bar()).encode_proto(),
+        )
+    }
+
+    fn proto_end() -> crate::messages::ResponseMessage {
+        proto_response(IncomingMessages::HistoricalDataEnd, HistoricalDataEndResponse::default().encode_proto())
+    }
+
+    fn proto_error(code: i32, text: &str) -> crate::messages::ResponseMessage {
+        let error = crate::proto::ErrorMessage {
+            id: Some(TEST_REQ_ID_FIRST),
+            error_code: Some(code),
+            error_msg: Some(text.to_owned()),
+            ..Default::default()
+        };
+        proto_response(IncomingMessages::Error, error.encode_to_vec())
+    }
+
+    /// An error frame in the text encoding of servers at or above ERROR_TIME.
+    fn text_error(code: i32, text: &str) -> crate::messages::ResponseMessage {
+        let mut message = text_response(format!("4|{TEST_REQ_ID_FIRST}|{code}|{text}||"));
+        message.server_version = server_versions::ERROR_TIME;
+        message
+    }
+
+    async fn send(responses: Vec<crate::messages::ResponseMessage>) -> HistoricalDataRequest {
+        let message_bus = Arc::new(MessageBusStub::with_ordered_responses(responses));
+        let mut client = Client::stubbed(message_bus, server_versions::PROTOBUF_HISTORICAL_DATA);
+        client.time_zone = Some(time_tz::timezones::db::UTC);
+        client
+            .historical_data(&test_contract(), BarSize::Hour)
+            .duration(Duration::days(1))
+            .send()
+            .await
+            .expect("sent")
+    }
+
+    fn codes(notices: &[Notice]) -> Vec<(i32, &str)> {
+        notices.iter().map(|n| (n.code, n.message.as_str())).collect()
+    }
+
+    #[tokio::test]
+    async fn informational_codes_are_kept_and_do_not_end_the_answer() {
+        // Text and protobuf error frames alike: 2174 is IB telling the caller
+        // something about a request it still serves.
+        for notice in [text_error(2174, NO_TIME_ZONE), proto_error(2174, NO_TIME_ZONE)] {
+            let mut request = send(vec![notice, proto_data(), proto_end()]).await;
+
+            let data = request.answer().await.expect("the answer still completes");
+
+            assert_eq!(data.bars.len(), 1);
+            assert_eq!(codes(&data.notices), vec![(2174, NO_TIME_ZONE)]);
+            assert_eq!(codes(request.notices()), vec![(2174, NO_TIME_ZONE)]);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_codes_end_the_answer_with_their_code_and_text() {
+        // Negative control for the above: 162 (pacing) and 10197 (competing
+        // session) end the request, raw, on both encodings.
+        for (code, text) in [(162, PACING), (10197, COMPETING)] {
+            for error in [text_error(code, text), proto_error(code, text)] {
+                let mut request = send(vec![text_error(2174, NO_TIME_ZONE), error]).await;
+
+                match request.answer().await {
+                    Err(Error::Notice(notice)) => assert_eq!((notice.code, notice.message.as_str()), (code, text)),
+                    other => panic!("expected IB's {code}, got {other:?}"),
+                }
+                assert_eq!(
+                    codes(request.notices()),
+                    vec![(2174, NO_TIME_ZONE), (code, text)],
+                    "every code for the request, in order"
+                );
+                assert!(!request.is_open(), "IB ended it: nothing to cancel");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatcher_classified_codes_are_kept_in_order() {
+        // As the live dispatcher delivers them: a 2100-2169 warning as a
+        // Notice item, any other code as an Error item.
+        let (sender, receiver) = broadcast::channel(16);
+        let mut request = HistoricalDataRequest {
+            request_id: TEST_REQ_ID_FIRST,
+            subscription: AsyncInternalSubscription::new(receiver),
+            message_bus: Arc::new(MessageBusStub::default()),
+            answer: common::HistoricalAnswer::new(TEST_REQ_ID_FIRST, server_versions::PROTOBUF_HISTORICAL_DATA, time_tz::timezones::db::UTC),
+            state: RequestState::Open,
+            ended: None,
+        };
+        let notice = |code: i32, text: &str| Notice {
+            code,
+            message: text.to_owned(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        };
+        sender
+            .send(RoutedItem::Notice(notice(2107, "HMDS data farm connection is inactive")))
+            .unwrap();
+        sender.send(RoutedItem::Error(Error::Notice(notice(2174, NO_TIME_ZONE)))).unwrap();
+        sender.send(proto_data().into()).unwrap();
+        sender.send(RoutedItem::Error(Error::Notice(notice(162, PACING)))).unwrap();
+
+        assert!(matches!(request.answer().await, Err(Error::Notice(n)) if n.code == 162));
+        assert_eq!(
+            codes(request.notices()),
+            vec![(2107, "HMDS data farm connection is inactive"), (2174, NO_TIME_ZONE), (162, PACING)]
+        );
+    }
+}
+
+// === Review D14.R1: a local end does not stop the cancel ===
+
+mod local_end_still_cancels {
+    use super::*;
+    use crate::common::test_utils::helpers::{proto_response, text_response};
+    use crate::messages::IncomingMessages;
+    use crate::testdata::builders::market_data::{full_historical_bar, HistoricalDataEndResponse, HistoricalDataResponse};
+    use crate::testdata::builders::ResponseProtoEncoder;
+    use crate::transport::AsyncInternalSubscription;
+    use std::time::Duration as StdDuration;
+    use tokio::sync::broadcast;
+
+    fn open_request(message_bus: Arc<MessageBusStub>) -> (broadcast::Sender<RoutedItem>, HistoricalDataRequest) {
+        let (sender, receiver) = broadcast::channel(16);
+        let request = HistoricalDataRequest {
+            request_id: TEST_REQ_ID_FIRST,
+            subscription: AsyncInternalSubscription::new(receiver),
+            message_bus,
+            answer: common::HistoricalAnswer::new(TEST_REQ_ID_FIRST, server_versions::PROTOBUF_HISTORICAL_DATA, time_tz::timezones::db::UTC),
+            state: RequestState::Open,
+            ended: None,
+        };
+        (sender, request)
+    }
+
+    fn cancels(message_bus: &MessageBusStub) -> usize {
+        count_proto_msgs(&message_bus.request_messages.read().unwrap(), OutgoingMessages::CancelHistoricalData)
+    }
+
+    fn unreadable_bar() -> RoutedItem {
+        let bar = crate::proto::HistoricalDataBar {
+            date: None,
+            ..full_historical_bar()
+        };
+        proto_response(
+            IncomingMessages::HistoricalData,
+            HistoricalDataResponse::default().bar(bar).encode_proto(),
+        )
+        .into()
+    }
+
+    fn proto_data() -> RoutedItem {
+        proto_response(
+            IncomingMessages::HistoricalData,
+            HistoricalDataResponse::default().bar(full_historical_bar()).encode_proto(),
+        )
+        .into()
+    }
+
+    fn proto_end() -> RoutedItem {
+        proto_response(IncomingMessages::HistoricalDataEnd, HistoricalDataEndResponse::default().encode_proto()).into()
+    }
+
+    /// End the answer with a local error, then cancel explicitly.
+    async fn cancel_after(item: RoutedItem) -> usize {
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (sender, mut request) = open_request(message_bus.clone());
+        sender.send(item).unwrap();
+
+        assert!(request.answer().await.is_err(), "the answer ends with the local error");
+        assert!(request.is_open(), "IB did not end it: still open");
+        request.cancel().await.expect("cancel written");
+        assert!(!request.is_open());
+        cancels(&message_bus)
+    }
+
+    #[tokio::test]
+    async fn lagged_error_then_cancel_writes_the_cancel() {
+        assert_eq!(cancel_after(RoutedItem::Error(Error::Lagged(1))).await, 1);
+    }
+
+    #[tokio::test]
+    async fn decode_error_then_cancel_writes_the_cancel() {
+        assert_eq!(cancel_after(unreadable_bar()).await, 1);
+    }
+
+    #[tokio::test]
+    async fn unexpected_message_then_cancel_writes_the_cancel() {
+        let tick_price = text_response("1|2|9000|1|185.50|100|7|").into();
+        assert_eq!(cancel_after(tick_price).await, 1);
+    }
+
+    #[tokio::test]
+    async fn drop_after_a_local_error_writes_the_cancel() {
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (sender, mut request) = open_request(message_bus.clone());
+        sender.send(unreadable_bar()).unwrap();
+        assert!(request.answer().await.is_err());
+
+        drop(request);
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+
+        assert_eq!(cancels(&message_bus), 1);
+    }
+
+    #[tokio::test]
+    async fn after_ibs_end_marker_neither_cancel_nor_drop_writes() {
+        // Control: IB ended the request, so there is nothing to cancel.
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (sender, mut request) = open_request(message_bus.clone());
+        sender.send(proto_data()).unwrap();
+        sender.send(proto_end()).unwrap();
+        request.answer().await.expect("complete");
+
+        request.cancel().await.expect("nothing to cancel");
+        drop(request);
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+
+        assert_eq!(cancels(&message_bus), 0);
+    }
+
+    #[tokio::test]
+    async fn after_the_session_is_lost_neither_cancel_nor_drop_writes() {
+        // Control: a closed channel or a reset is the session gone, and IB
+        // drops its requests with it.
+        for item in [Some(RoutedItem::Error(Error::ConnectionReset)), None] {
+            let message_bus = Arc::new(MessageBusStub::default());
+            let (sender, mut request) = open_request(message_bus.clone());
+            match item {
+                Some(item) => {
+                    sender.send(item).unwrap();
+                }
+                None => drop(sender),
+            }
+            assert!(matches!(request.answer().await, Err(Error::Interrupted(TEST_REQ_ID_FIRST))));
+            assert!(!request.is_open());
+
+            request.cancel().await.expect("nothing to cancel");
+            drop(request);
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+
+            assert_eq!(cancels(&message_bus), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn after_an_ib_error_code_neither_cancel_nor_drop_writes() {
+        // Control: a code that ends the request is IB ending it.
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (sender, mut request) = open_request(message_bus.clone());
+        let pacing = crate::messages::Notice {
+            code: 162,
+            message: "Historical Market Data Service error message:Historical data request pacing violation".to_owned(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        };
+        sender.send(RoutedItem::Error(Error::Notice(pacing))).unwrap();
+        assert!(matches!(request.answer().await, Err(Error::Notice(_))));
+        assert!(!request.is_open());
+
+        request.cancel().await.expect("nothing to cancel");
+        drop(request);
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+
+        assert_eq!(cancels(&message_bus), 0);
+    }
 }

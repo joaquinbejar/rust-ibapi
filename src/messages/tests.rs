@@ -1595,6 +1595,7 @@ fn test_request_id_index_comprehensive() {
     assert_eq!(request_id_index(IncomingMessages::TickEFP), Some(2));
     assert_eq!(request_id_index(IncomingMessages::TickReqParams), Some(1));
     assert_eq!(request_id_index(IncomingMessages::TickSnapshotEnd), Some(2));
+    assert_eq!(request_id_index(IncomingMessages::MarketDataType), Some(2));
 
     // Test message types without request_id
     assert_eq!(request_id_index(IncomingMessages::ManagedAccounts), None);

@@ -201,11 +201,12 @@ impl<S: Stream> TcpMessageBus<S> {
         // Err(Full) is the desired no-op (idempotent across duplicate calls).
         let _ = self.shutdown_send.try_send(());
 
-        // Break the dispatcher's blocked read so it exits without waiting
-        // for the 1s socket-read timeout. Errors are non-fatal — a closed
-        // or already-shutdown socket still terminates the read.
-        if let Err(e) = self.connection.shutdown_read() {
-            debug!("shutdown_read returned: {e:?}");
+        // Close the socket for real: no message is sent from now on, the
+        // peer sees the connection end, and the dispatcher's blocked read
+        // ends without waiting for the 1s socket-read timeout. Errors are
+        // non-fatal: a closed or already shut down socket is closed.
+        if let Err(e) = self.connection.shutdown() {
+            debug!("shutdown returned: {e:?}");
         }
     }
 
@@ -258,6 +259,12 @@ impl<S: Stream> TcpMessageBus<S> {
                     self.dispatch_message(message);
                     Ok(())
                 }
+            }
+            // A shutdown closes the socket, which fails this read: that is
+            // the end, never a reason to reconnect.
+            Err(_) if self.is_shutting_down() => {
+                debug!("dispatcher thread exiting after shutdown");
+                Err(Error::Shutdown)
             }
             Err(ref err) if is_timeout_error(err) => {
                 if self.is_shutting_down() {
@@ -735,13 +742,23 @@ impl<K: std::hash::Hash + Eq + std::fmt::Debug, V: std::fmt::Debug> SenderHash<K
     }
 }
 
+/// # Closing
+///
+/// `shutdown` goes through `shutdown_handle`, a clone of the stream that is
+/// independent of the reader's and the writer's locks, so it never waits
+/// behind a read or a write in progress: it shuts down both directions, which
+/// fails a blocked write and ends a blocked read. A write checks `closed`
+/// before taking the writer's lock and again after, so a write that had not
+/// started when the close began is refused with [`Error::Closed`] without
+/// touching the socket. Bytes the kernel accepted before are not undone.
 #[derive(Debug)]
 pub(crate) struct TcpSocket {
     reader: Mutex<TcpStream>,
     writer: Mutex<TcpStream>,
-    /// Extra clone of the active stream used solely to break the dispatcher's
-    /// blocking read on shutdown. Refreshed on every `reconnect`.
+    /// Extra clone of the active stream, used to close it. Refreshed on every
+    /// `reconnect`.
     shutdown_handle: Mutex<TcpStream>,
+    closed: AtomicBool,
     connection_url: String,
     tcp_no_delay: bool,
 }
@@ -762,14 +779,30 @@ impl TcpSocket {
             reader: Mutex::new(stream),
             writer: Mutex::new(writer),
             shutdown_handle: Mutex::new(shutdown_handle),
+            closed: AtomicBool::new(false),
             connection_url: connection_url.to_string(),
             tcp_no_delay,
         })
     }
 }
 
+impl TcpSocket {
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn close_socket(&self) -> Result<(), Error> {
+        let handle = self.shutdown_handle.lock()?;
+        handle.shutdown(std::net::Shutdown::Both)?;
+        Ok(())
+    }
+}
+
 impl Reconnect for TcpSocket {
     fn reconnect(&self) -> Result<(), Error> {
+        if self.is_closed() {
+            return Err(Error::Closed);
+        }
         match TcpStream::connect(&self.connection_url) {
             Ok(stream) => {
                 stream.set_read_timeout(Some(TWS_READ_TIMEOUT))?;
@@ -783,7 +816,15 @@ impl Reconnect for TcpSocket {
 
                 let mut shutdown_handle = self.shutdown_handle.lock()?;
                 *shutdown_handle = stream;
+                drop(shutdown_handle);
 
+                // A close that ran while this reconnected shut down the old
+                // socket: do the same to the new one rather than bring it to
+                // life.
+                if self.is_closed() {
+                    let _ = self.close_socket();
+                    return Err(Error::Closed);
+                }
                 Ok(())
             }
             Err(e) => Err(e.into()),
@@ -792,22 +833,21 @@ impl Reconnect for TcpSocket {
     fn sleep(&self, duration: std::time::Duration) {
         thread::sleep(duration)
     }
-    fn shutdown_read(&self) -> Result<(), Error> {
-        let handle = self.shutdown_handle.lock()?;
-        // Shutdown::Read is enough to break the blocked read; future writes
-        // (none expected during shutdown) remain functional.
-        handle.shutdown(std::net::Shutdown::Read)?;
-        Ok(())
+    fn shutdown(&self) -> Result<(), Error> {
+        self.closed.store(true, Ordering::Release);
+        self.close_socket()
     }
 }
 
 pub(crate) trait Reconnect {
     fn reconnect(&self) -> Result<(), Error>;
     fn sleep(&self, duration: std::time::Duration);
-    /// Interrupt any in-flight blocking read so the dispatcher exits promptly
-    /// on shutdown. For `TcpSocket` this shuts down the read half; for the
-    /// in-memory test fixtures it closes their inbound queue.
-    fn shutdown_read(&self) -> Result<(), Error>;
+    /// Close the stream for real, at once and for good: refuse every write
+    /// from now on, and end any in-flight blocking read or write without
+    /// waiting for it, so the dispatcher exits promptly. For `TcpSocket` this
+    /// shuts down both directions of the socket; for the in-memory test
+    /// fixtures it closes their queues. Idempotent.
+    fn shutdown(&self) -> Result<(), Error>;
 }
 
 pub(crate) trait Stream: Io + Reconnect + Sync + Send + 'static + std::fmt::Debug {}
@@ -835,7 +875,15 @@ impl Io for TcpSocket {
     }
 
     fn write_all(&self, buf: &[u8]) -> Result<(), Error> {
+        if self.is_closed() {
+            return Err(Error::Closed);
+        }
         let mut writer = self.writer.lock()?;
+        // A writer that queued on the lock before the close began is refused
+        // here, still without a byte handed to the socket.
+        if self.is_closed() {
+            return Err(Error::Closed);
+        }
         writer.write_all(buf)?;
         Ok(())
     }
@@ -856,3 +904,6 @@ pub(crate) mod test_listener;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod close_tests;
