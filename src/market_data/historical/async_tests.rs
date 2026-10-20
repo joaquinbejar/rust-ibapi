@@ -1465,3 +1465,161 @@ mod codes {
         );
     }
 }
+
+// === Review D14.R1: a local end does not stop the cancel ===
+
+mod local_end_still_cancels {
+    use super::*;
+    use crate::common::test_utils::helpers::{proto_response, text_response};
+    use crate::messages::IncomingMessages;
+    use crate::testdata::builders::market_data::{full_historical_bar, HistoricalDataEndResponse, HistoricalDataResponse};
+    use crate::testdata::builders::ResponseProtoEncoder;
+    use crate::transport::AsyncInternalSubscription;
+    use std::time::Duration as StdDuration;
+    use tokio::sync::broadcast;
+
+    fn open_request(message_bus: Arc<MessageBusStub>) -> (broadcast::Sender<RoutedItem>, HistoricalDataRequest) {
+        let (sender, receiver) = broadcast::channel(16);
+        let request = HistoricalDataRequest {
+            request_id: TEST_REQ_ID_FIRST,
+            subscription: AsyncInternalSubscription::new(receiver),
+            message_bus,
+            answer: common::HistoricalAnswer::new(TEST_REQ_ID_FIRST, server_versions::PROTOBUF_HISTORICAL_DATA, time_tz::timezones::db::UTC),
+            state: RequestState::Open,
+            ended: None,
+        };
+        (sender, request)
+    }
+
+    fn cancels(message_bus: &MessageBusStub) -> usize {
+        count_proto_msgs(&message_bus.request_messages.read().unwrap(), OutgoingMessages::CancelHistoricalData)
+    }
+
+    fn unreadable_bar() -> RoutedItem {
+        let bar = crate::proto::HistoricalDataBar {
+            date: None,
+            ..full_historical_bar()
+        };
+        proto_response(
+            IncomingMessages::HistoricalData,
+            HistoricalDataResponse::default().bar(bar).encode_proto(),
+        )
+        .into()
+    }
+
+    fn proto_data() -> RoutedItem {
+        proto_response(
+            IncomingMessages::HistoricalData,
+            HistoricalDataResponse::default().bar(full_historical_bar()).encode_proto(),
+        )
+        .into()
+    }
+
+    fn proto_end() -> RoutedItem {
+        proto_response(IncomingMessages::HistoricalDataEnd, HistoricalDataEndResponse::default().encode_proto()).into()
+    }
+
+    /// End the answer with a local error, then cancel explicitly.
+    async fn cancel_after(item: RoutedItem) -> usize {
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (sender, mut request) = open_request(message_bus.clone());
+        sender.send(item).unwrap();
+
+        assert!(request.answer().await.is_err(), "the answer ends with the local error");
+        assert!(request.is_open(), "IB did not end it: still open");
+        request.cancel().await.expect("cancel written");
+        assert!(!request.is_open());
+        cancels(&message_bus)
+    }
+
+    #[tokio::test]
+    async fn lagged_error_then_cancel_writes_the_cancel() {
+        assert_eq!(cancel_after(RoutedItem::Error(Error::Lagged(1))).await, 1);
+    }
+
+    #[tokio::test]
+    async fn decode_error_then_cancel_writes_the_cancel() {
+        assert_eq!(cancel_after(unreadable_bar()).await, 1);
+    }
+
+    #[tokio::test]
+    async fn unexpected_message_then_cancel_writes_the_cancel() {
+        let tick_price = text_response("1|2|9000|1|185.50|100|7|").into();
+        assert_eq!(cancel_after(tick_price).await, 1);
+    }
+
+    #[tokio::test]
+    async fn drop_after_a_local_error_writes_the_cancel() {
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (sender, mut request) = open_request(message_bus.clone());
+        sender.send(unreadable_bar()).unwrap();
+        assert!(request.answer().await.is_err());
+
+        drop(request);
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+
+        assert_eq!(cancels(&message_bus), 1);
+    }
+
+    #[tokio::test]
+    async fn after_ibs_end_marker_neither_cancel_nor_drop_writes() {
+        // Control: IB ended the request, so there is nothing to cancel.
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (sender, mut request) = open_request(message_bus.clone());
+        sender.send(proto_data()).unwrap();
+        sender.send(proto_end()).unwrap();
+        request.answer().await.expect("complete");
+
+        request.cancel().await.expect("nothing to cancel");
+        drop(request);
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+
+        assert_eq!(cancels(&message_bus), 0);
+    }
+
+    #[tokio::test]
+    async fn after_the_session_is_lost_neither_cancel_nor_drop_writes() {
+        // Control: a closed channel or a reset is the session gone, and IB
+        // drops its requests with it.
+        for item in [Some(RoutedItem::Error(Error::ConnectionReset)), None] {
+            let message_bus = Arc::new(MessageBusStub::default());
+            let (sender, mut request) = open_request(message_bus.clone());
+            match item {
+                Some(item) => {
+                    sender.send(item).unwrap();
+                }
+                None => drop(sender),
+            }
+            assert!(matches!(request.answer().await, Err(Error::Interrupted(TEST_REQ_ID_FIRST))));
+            assert!(!request.is_open());
+
+            request.cancel().await.expect("nothing to cancel");
+            drop(request);
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+
+            assert_eq!(cancels(&message_bus), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn after_an_ib_error_code_neither_cancel_nor_drop_writes() {
+        // Control: a code that ends the request is IB ending it.
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (sender, mut request) = open_request(message_bus.clone());
+        let pacing = crate::messages::Notice {
+            code: 162,
+            message: "Historical Market Data Service error message:Historical data request pacing violation".to_owned(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        };
+        sender.send(RoutedItem::Error(Error::Notice(pacing))).unwrap();
+        assert!(matches!(request.answer().await, Err(Error::Notice(_))));
+        assert!(!request.is_open());
+
+        request.cancel().await.expect("nothing to cancel");
+        drop(request);
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+
+        assert_eq!(cancels(&message_bus), 0);
+    }
+}

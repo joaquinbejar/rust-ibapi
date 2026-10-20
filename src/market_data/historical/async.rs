@@ -317,9 +317,11 @@ pub(crate) async fn historical_data(
 /// Where a [`HistoricalDataRequest`] stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequestState {
-    /// Sent, and not ended or cancelled: IB may still be serving it.
+    /// Sent, and neither ended by IB nor cancelled: IB may still be serving
+    /// it, even after a local error ended the answer.
     Open,
-    /// Ended by IB (end marker or error) or locally (interrupted, undecodable).
+    /// Not live at IB: IB ended it (its end marker, or a code that ends the
+    /// request), or the session it was sent on is gone (interrupted).
     Ended,
     /// A cancel request was written for it.
     Cancelled,
@@ -343,7 +345,7 @@ enum RequestState {
 /// - [`cancel`](Self::cancel) writes `cancelHistoricalData` for this id and
 ///   says whether it was written.
 ///
-/// Dropping an open handle (no answer, no cancel) sends the cancel on a
+/// Dropping an open handle (not ended by IB, not cancelled) sends the cancel on a
 /// spawned task, as [`Subscription`](crate::subscriptions::Subscription)
 /// does; call [`cancel`](Self::cancel) to know whether it went out.
 #[must_use = "HistoricalDataRequest must be answered or cancelled; dropping it while open cancels the request"]
@@ -362,7 +364,10 @@ impl HistoricalDataRequest {
         self.request_id
     }
 
-    /// Whether the request is still open: sent, not ended, not cancelled.
+    /// Whether the request may still be live at IB: sent, not ended by IB,
+    /// its session not lost, not cancelled. A local error that ended
+    /// [`answer`](Self::answer) (a lagged channel, an undecodable or
+    /// unexpected message) leaves it open.
     pub fn is_open(&self) -> bool {
         self.state == RequestState::Open
     }
@@ -418,7 +423,12 @@ impl HistoricalDataRequest {
         loop {
             let item = self.subscription.next_item().await;
             if let Some(result) = self.answer.accept(item) {
-                self.state = RequestState::Ended;
+                // A local end (lagged channel, undecodable or unexpected
+                // message) proves nothing about IB: the request stays open, so
+                // cancel() and Drop still write the cancel.
+                if !self.answer.may_be_live_at_ib() {
+                    self.state = RequestState::Ended;
+                }
                 self.ended = Some(result.clone());
                 return result;
             }
@@ -465,7 +475,10 @@ impl HistoricalDataRequest {
     /// Cancel the request at IB: write `cancelHistoricalData` for its id.
     ///
     /// `Ok(())` when the cancel was written, by this call or an earlier one,
-    /// and when there is nothing to cancel because the request already ended.
+    /// and when there is nothing to cancel: IB already ended the request (its
+    /// end marker, or a code that ends it), or its session is gone
+    /// ([`Error::Interrupted`]). After a local error (a lagged channel, an
+    /// undecodable message) the cancel is written.
     /// On a write error the request stays open (a later call tries again), and
     /// the error says what happened: only [`Error::Closed`] and
     /// [`Error::Refused`] prove nothing was written.

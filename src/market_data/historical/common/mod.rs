@@ -31,6 +31,8 @@ pub(crate) struct HistoricalAnswer {
     time_zone: &'static Tz,
     data: Option<HistoricalData>,
     notices: Vec<Notice>,
+    ended_at_ib: bool,
+    session_lost: bool,
 }
 
 impl HistoricalAnswer {
@@ -41,7 +43,21 @@ impl HistoricalAnswer {
             time_zone,
             data: None,
             notices: Vec::new(),
+            ended_at_ib: false,
+            session_lost: false,
         }
+    }
+
+    /// Whether IB may still be serving the request. Not once IB itself ended
+    /// it (its end marker, or on servers without one its data message, or a
+    /// code that ends the request), and not once the session it was sent on
+    /// is gone (the channel closed or reset: IB drops a session's requests
+    /// with it). A local end of the answer (a lagged channel, an undecodable
+    /// or unexpected message) proves neither: the request still needs a
+    /// cancel.
+    #[cfg_attr(not(feature = "async"), allow(dead_code))] // read by the async request handle
+    pub(crate) fn may_be_live_at_ib(&self) -> bool {
+        !self.ended_at_ib && !self.session_lost
     }
 
     /// Every error and notice IB sent for the request so far, in order, the
@@ -58,7 +74,10 @@ impl HistoricalAnswer {
         match item {
             Some(RoutedItem::Response(mut message)) => self.accept_message(&mut message),
             Some(RoutedItem::Notice(notice)) | Some(RoutedItem::Error(Error::Notice(notice))) => self.accept_notice(notice),
-            Some(RoutedItem::Error(Error::ConnectionReset)) | None => Some(Err(Error::Interrupted(self.request_id))),
+            Some(RoutedItem::Error(Error::ConnectionReset)) | None => {
+                self.session_lost = true;
+                Some(Err(Error::Interrupted(self.request_id)))
+            }
             Some(RoutedItem::Error(e)) => Some(Err(e)),
         }
     }
@@ -70,6 +89,7 @@ impl HistoricalAnswer {
         if is_historical_data_notice(notice.code) {
             None
         } else {
+            self.ended_at_ib = true;
             Some(Err(Error::Notice(notice)))
         }
     }
@@ -83,12 +103,15 @@ impl HistoricalAnswer {
                 };
                 if self.server_version < server_versions::HISTORICAL_DATA_END {
                     // No end marker on these servers: the data message is the whole answer.
+                    self.ended_at_ib = true;
                     return Some(Ok(self.with_notices(data)));
                 }
                 self.data = Some(data);
                 None
             }
             IncomingMessages::HistoricalDataEnd if self.data.is_some() => {
+                // IB ended the request, whether or not its marker decodes.
+                self.ended_at_ib = true;
                 let (start, end) = match decoders::decode_historical_data_end(self.server_version, self.time_zone, message) {
                     Ok(window) => window,
                     Err(e) => return Some(Err(e)),
