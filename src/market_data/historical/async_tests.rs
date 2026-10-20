@@ -1158,3 +1158,179 @@ mod end_marker {
         }
     }
 }
+
+// === D14 item 3: request id, cancel and a per-call timeout ===
+
+mod request_handle {
+    use super::*;
+    use crate::common::test_utils::helpers::{decode_request_proto, proto_response};
+    use crate::messages::IncomingMessages;
+    use crate::testdata::builders::market_data::{full_historical_bar, HistoricalDataEndResponse, HistoricalDataResponse};
+    use crate::testdata::builders::ResponseProtoEncoder;
+    use crate::transport::AsyncInternalSubscription;
+    use std::time::Duration as StdDuration;
+    use tokio::sync::broadcast;
+
+    /// A request whose channel stays open until the test drops the sender, as
+    /// a Gateway that is slow to answer.
+    fn open_request(message_bus: Arc<MessageBusStub>) -> (broadcast::Sender<RoutedItem>, HistoricalDataRequest) {
+        let (sender, receiver) = broadcast::channel(16);
+        let request = HistoricalDataRequest {
+            request_id: TEST_REQ_ID_FIRST,
+            subscription: AsyncInternalSubscription::new(receiver),
+            message_bus,
+            answer: common::HistoricalAnswer::new(TEST_REQ_ID_FIRST, server_versions::PROTOBUF_HISTORICAL_DATA, time_tz::timezones::db::UTC),
+            state: RequestState::Open,
+            ended: None,
+        };
+        (sender, request)
+    }
+
+    fn proto_data() -> RoutedItem {
+        proto_response(
+            IncomingMessages::HistoricalData,
+            HistoricalDataResponse::default().bar(full_historical_bar()).encode_proto(),
+        )
+        .into()
+    }
+
+    fn proto_end() -> RoutedItem {
+        proto_response(IncomingMessages::HistoricalDataEnd, HistoricalDataEndResponse::default().encode_proto()).into()
+    }
+
+    fn cancels(message_bus: &MessageBusStub) -> usize {
+        count_proto_msgs(&message_bus.request_messages.read().unwrap(), OutgoingMessages::CancelHistoricalData)
+    }
+
+    #[tokio::test]
+    async fn send_exposes_the_request_id_it_wrote() {
+        let message_bus = Arc::new(MessageBusStub::default());
+        let client = Client::stubbed(message_bus.clone(), server_versions::PROTOBUF_HISTORICAL_DATA);
+
+        let request = client
+            .historical_data(&test_contract(), BarSize::Hour)
+            .duration(Duration::days(1))
+            .send()
+            .await
+            .expect("sent");
+
+        assert_eq!(request.request_id(), TEST_REQ_ID_FIRST);
+        let written: crate::proto::HistoricalDataRequest = decode_request_proto(&message_bus, 0);
+        assert_eq!(written.req_id, Some(request.request_id()), "the id exposed is the id written");
+    }
+
+    #[tokio::test]
+    async fn slow_answer_times_out_and_is_cancelled_by_its_id() {
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (sender, mut request) = open_request(message_bus.clone());
+        sender.send(proto_data()).unwrap();
+
+        // The bars arrived, the end marker did not: the per-call timeout fires.
+        let result = request.answer_within(StdDuration::from_millis(20)).await;
+        assert!(
+            matches!(result, Err(Error::TimedOut(TEST_REQ_ID_FIRST))),
+            "expected TimedOut, got {result:?}"
+        );
+        assert!(request.is_open(), "a timeout leaves the request open at IB");
+        assert_eq!(cancels(&message_bus), 0, "a timeout alone writes nothing");
+
+        request.cancel().await.expect("cancel written");
+        assert!(!request.is_open());
+        assert_eq!(cancels(&message_bus), 1);
+        let cancel: crate::proto::CancelHistoricalData = decode_request_proto(&message_bus, 0);
+        assert_eq!(cancel.req_id, Some(TEST_REQ_ID_FIRST), "the cancel names this request");
+
+        // Cancelled is terminal and idempotent: no second cancel, no answer.
+        request.cancel().await.expect("idempotent");
+        assert_eq!(cancels(&message_bus), 1);
+        assert!(matches!(request.answer().await, Err(Error::Cancelled)));
+        drop(request);
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+        assert_eq!(cancels(&message_bus), 1, "a cancelled request sends no cancel on drop");
+    }
+
+    #[tokio::test]
+    async fn answer_after_a_timeout_keeps_what_arrived() {
+        // Negative control for the timeout: the end marker arrives late, and
+        // the answer is complete with the bars that came before the timeout.
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (sender, mut request) = open_request(message_bus.clone());
+        sender.send(proto_data()).unwrap();
+
+        assert!(matches!(
+            request.answer_within(StdDuration::from_millis(20)).await,
+            Err(Error::TimedOut(_))
+        ));
+        sender.send(proto_end()).unwrap();
+
+        let data = request.answer_within(StdDuration::from_secs(5)).await.expect("complete answer");
+        assert_eq!(data.bars.len(), 1, "the bar received before the timeout is kept");
+        assert_eq!(data.end, Some(datetime!(2023-03-15 10:30:00 UTC)));
+        assert!(!request.is_open());
+
+        // Ended by IB: nothing to cancel, now or on drop.
+        request.cancel().await.expect("nothing to cancel");
+        drop(request);
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+        assert_eq!(cancels(&message_bus), 0);
+    }
+
+    #[tokio::test]
+    async fn ended_answer_is_repeated() {
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (sender, mut request) = open_request(message_bus);
+        sender.send(proto_data()).unwrap();
+        sender.send(proto_end()).unwrap();
+
+        let first = request.answer().await.expect("complete");
+        let second = request.answer().await.expect("same answer");
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn cancel_that_cannot_be_written_leaves_the_request_open() {
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (_sender, mut request) = open_request(message_bus.clone());
+        message_bus.set_fail_sends(true);
+
+        let result = request.cancel().await;
+        assert!(result.is_err(), "the write error is reported");
+        assert!(request.is_open(), "an unwritten cancel does not close the request");
+
+        message_bus.set_fail_sends(false);
+        request.cancel().await.expect("written on retry");
+        assert_eq!(cancels(&message_bus), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_an_open_request_cancels_it() {
+        let message_bus = Arc::new(MessageBusStub::default());
+        let (_sender, request) = open_request(message_bus.clone());
+
+        drop(request);
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+
+        assert_eq!(cancels(&message_bus), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_writes_no_cancel_after_a_complete_answer() {
+        // Text path: a complete answer through fetch() leaves nothing to cancel.
+        let message_bus = Arc::new(MessageBusStub::with_responses(vec![
+            "17|9000|1|1678886400|185.50|186.00|185.25|185.75|1000|185.70|100|".to_owned(),
+            "108|9000|20230315 09:30:00 UTC|20230315 10:30:00 UTC|".to_owned(),
+        ]));
+        let mut client = Client::stubbed(message_bus.clone(), server_versions::HISTORICAL_DATA_END);
+        client.time_zone = Some(time_tz::timezones::db::UTC);
+
+        client
+            .historical_data(&test_contract(), BarSize::Hour)
+            .duration(Duration::days(1))
+            .fetch()
+            .await
+            .expect("complete");
+        tokio::time::sleep(StdDuration::from_millis(20)).await;
+
+        assert_eq!(request_message_count(&message_bus), 1, "the request only, no cancel");
+    }
+}

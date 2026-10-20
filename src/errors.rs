@@ -127,6 +127,14 @@ pub enum Error {
     #[error("Interrupted: request {0} ended before IB completed its answer")]
     Interrupted(i32),
 
+    /// The request's answer did not complete within the caller's timeout.
+    /// Carries IB's request id.
+    ///
+    /// The request is still open at IB, which may still be serving it, until
+    /// the caller cancels it.
+    #[error("TimedOut: request {0} got no complete answer within its timeout")]
+    TimedOut(i32),
+
     /// The subscription's channel overflowed and dropped this many messages.
     ///
     /// Whatever the subscription delivered before is incomplete, and an end
@@ -241,6 +249,7 @@ impl Clone for Error {
             Error::UnexpectedResponse(m) => Error::UnexpectedResponse(m.clone()),
             Error::UnexpectedEndOfStream => Error::UnexpectedEndOfStream,
             Error::Interrupted(request_id) => Error::Interrupted(*request_id),
+            Error::TimedOut(request_id) => Error::TimedOut(*request_id),
             Error::Lagged(skipped) => Error::Lagged(*skipped),
             Error::Notice(n) => Error::Notice(n.clone()),
             Error::AlreadySubscribed => Error::AlreadySubscribed,
