@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Show first 5 and last 5 bars
         for (i, bar) in historical_data.bars.iter().take(5).enumerate() {
             println!(
-                "Bar {}: {} - O: ${:.2}, H: ${:.2}, L: ${:.2}, C: ${:.2}, V: {:.0}",
+                "Bar {}: {} - O: {:.2?}, H: {:.2?}, L: {:.2?}, C: {:.2?}, V: {:.0?}",
                 i + 1,
                 format!("{:02}:{:02}", bar.date.hour(), bar.date.minute()),
                 bar.open,
@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let start_idx = historical_data.bars.len() - 5;
             for (i, bar) in historical_data.bars.iter().skip(start_idx).enumerate() {
                 println!(
-                    "Bar {}: {} - O: ${:.2}, H: ${:.2}, L: ${:.2}, C: ${:.2}, V: {:.0}",
+                    "Bar {}: {} - O: {:.2?}, H: {:.2?}, L: {:.2?}, C: {:.2?}, V: {:.0?}",
                     start_idx + i + 1,
                     format!("{:02}:{:02}", bar.date.hour(), bar.date.minute()),
                     bar.open,
@@ -145,13 +145,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Daily bars received: {}", daily_data.bars.len());
         for bar in daily_data.bars.iter().take(5) {
             println!(
-                "{}: O: ${:.2}, H: ${:.2}, L: ${:.2}, C: ${:.2}, V: {:.0}K",
+                "{}: O: {:.2?}, H: {:.2?}, L: {:.2?}, C: {:.2?}, V: {:.0?}K",
                 format!("{:04}-{:02}-{:02}", bar.date.year(), bar.date.month() as u8, bar.date.day()),
                 bar.open,
                 bar.high,
                 bar.low,
                 bar.close,
-                bar.volume / 1000.0
+                bar.volume.map(|volume| volume / 1000.0)
             );
         }
 
@@ -169,7 +169,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Bid bars (1-min): {} bars", bid_data.bars.len());
         if let Some(bar) = bid_data.bars.first() {
             println!(
-                "  First bar: {:02}:{:02}:{:02} - Bid: ${:.2}",
+                "  First bar: {:02}:{:02}:{:02} - Bid: {:.2?}",
                 bar.date.hour(),
                 bar.date.minute(),
                 bar.date.second(),
@@ -188,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Ask bars (1-min): {} bars", ask_data.bars.len());
         if let Some(bar) = ask_data.bars.first() {
             println!(
-                "  First bar: {:02}:{:02}:{:02} - Ask: ${:.2}",
+                "  First bar: {:02}:{:02}:{:02} - Ask: {:.2?}",
                 bar.date.hour(),
                 bar.date.minute(),
                 bar.date.second(),
@@ -231,7 +231,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Received {} initial historical bars", data.bars.len());
                 if let Some(bar) = data.bars.last() {
                     println!(
-                        "  Latest: {} - O: ${:.2}, H: ${:.2}, L: ${:.2}, C: ${:.2}",
+                        "  Latest: {} - O: {:.2?}, H: {:.2?}, L: {:.2?}, C: {:.2?}",
                         format!("{:02}:{:02}", bar.date.hour(), bar.date.minute()),
                         bar.open,
                         bar.high,
@@ -243,7 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(HistoricalBarUpdate::Update(bar)) => {
                 println!(
-                    "UPDATE: {} - O: ${:.2}, H: ${:.2}, L: ${:.2}, C: ${:.2}, V: {:.0}",
+                    "UPDATE: {} - O: {:.2?}, H: {:.2?}, L: {:.2?}, C: {:.2?}, V: {:.0?}",
                     format!("{:02}:{:02}:{:02}", bar.date.hour(), bar.date.minute(), bar.date.second()),
                     bar.open,
                     bar.high,

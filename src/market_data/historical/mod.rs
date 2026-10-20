@@ -58,26 +58,34 @@ pub enum HistoricalParseError {
 }
 
 /// Bar describes the historical data bar.
+///
+/// Every value is exactly what IB stated for the bar. A value IB left out is
+/// `None`, never `0.0`: an absent price is not a price of zero. Values IB does
+/// state are kept as stated, zero and negative included (IB sends `-1` for
+/// volume, WAP and count on bar types that do not carry them, such as
+/// `MIDPOINT`). A bar whose time is absent or unreadable is not a bar: the
+/// decoder fails instead of inventing one.
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, PartialEq, Copy, Serialize, Deserialize)]
 pub struct Bar {
-    /// The bar's date and time (either as a yyyymmss hh:mm:ss formatted string or as system time according to the request). Time zone is the TWS time zone chosen on login.
-    // pub time: OffsetDateTime,
+    /// The bar's start time, as IB stated it (a date for daily and longer bars,
+    /// at midnight UTC; an instant in the session's time zone otherwise).
     pub date: OffsetDateTime,
-    /// The bar's open price.
-    pub open: f64,
-    /// The bar's high price.
-    pub high: f64,
-    /// The bar's low price.
-    pub low: f64,
-    /// The bar's close price.
-    pub close: f64,
-    /// The bar's traded volume if available (only available for TRADES)
-    pub volume: f64,
-    /// The bar's Weighted Average Price (only available for TRADES)
-    pub wap: f64,
-    /// The number of trades during the bar's timespan (only available for TRADES)
-    pub count: i32,
+    /// The bar's open price, `None` when IB left it out.
+    pub open: Option<f64>,
+    /// The bar's high price, `None` when IB left it out.
+    pub high: Option<f64>,
+    /// The bar's low price, `None` when IB left it out.
+    pub low: Option<f64>,
+    /// The bar's close price, `None` when IB left it out.
+    pub close: Option<f64>,
+    /// The bar's traded volume, `None` when IB left it out.
+    pub volume: Option<f64>,
+    /// The bar's weighted average price, `None` when IB left it out.
+    pub wap: Option<f64>,
+    /// The number of trades during the bar's timespan, `None` when IB left it
+    /// out (including text messages older than version 3, which carry none).
+    pub count: Option<i32>,
 }
 
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]

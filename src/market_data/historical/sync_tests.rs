@@ -154,13 +154,13 @@ fn test_historical_data() {
     assert_eq!(historical_data.bars.len(), 2, "historical_data.bars.len()");
 
     assert_eq!(historical_data.bars[0].date, datetime!(2023-04-13 00:00:00 UTC), "bar.date");
-    assert_eq!(historical_data.bars[0].open, 182.94, "bar.open");
-    assert_eq!(historical_data.bars[0].high, 186.50, "bar.high");
-    assert_eq!(historical_data.bars[0].low, 180.94, "bar.low");
-    assert_eq!(historical_data.bars[0].close, 185.90, "bar.close");
-    assert_eq!(historical_data.bars[0].volume, 948837.22, "bar.volume");
-    assert_eq!(historical_data.bars[0].wap, 184.869, "bar.wap");
-    assert_eq!(historical_data.bars[0].count, 324891, "bar.count");
+    assert_eq!(historical_data.bars[0].open, Some(182.94), "bar.open");
+    assert_eq!(historical_data.bars[0].high, Some(186.50), "bar.high");
+    assert_eq!(historical_data.bars[0].low, Some(180.94), "bar.low");
+    assert_eq!(historical_data.bars[0].close, Some(185.90), "bar.close");
+    assert_eq!(historical_data.bars[0].volume, Some(948837.22), "bar.volume");
+    assert_eq!(historical_data.bars[0].wap, Some(184.869), "bar.wap");
+    assert_eq!(historical_data.bars[0].count, Some(324891), "bar.count");
 
     // Assert Request
     assert_eq!(request_message_count(&message_bus), 1);
@@ -761,7 +761,7 @@ fn test_historical_data_streaming_with_updates() {
     match update1.unwrap().expect("expected Ok") {
         HistoricalBarUpdate::Historical(data) => {
             assert_eq!(data.bars.len(), 1, "Should have 1 initial bar");
-            assert_eq!(data.bars[0].open, 185.50, "Wrong open price");
+            assert_eq!(data.bars[0].open, Some(185.50), "Wrong open price");
         }
         _ => panic!("Expected Historical variant"),
     }
@@ -771,9 +771,9 @@ fn test_historical_data_streaming_with_updates() {
     assert!(update2.is_some(), "Should receive streaming update");
     match update2.unwrap().expect("expected Ok") {
         HistoricalBarUpdate::Update(bar) => {
-            assert_eq!(bar.open, 185.80, "Wrong open price in update");
-            assert_eq!(bar.high, 186.10, "Wrong high price in update");
-            assert_eq!(bar.close, 185.90, "Wrong close price in update");
+            assert_eq!(bar.open, Some(185.80), "Wrong open price in update");
+            assert_eq!(bar.high, Some(186.10), "Wrong high price in update");
+            assert_eq!(bar.close, Some(185.90), "Wrong close price in update");
         }
         _ => panic!("Expected Update variant"),
     }

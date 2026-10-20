@@ -170,25 +170,25 @@ async fn test_historical_data() {
     let bar = &data.bars[0];
     // 1678886400 = 2023-03-15 13:20:00 UTC
     assert_eq!(bar.date, datetime!(2023-03-15 13:20:00 UTC), "Wrong date for first bar");
-    assert_eq!(bar.open, 185.50, "Wrong open for first bar");
-    assert_eq!(bar.high, 186.00, "Wrong high for first bar");
-    assert_eq!(bar.low, 185.25, "Wrong low for first bar");
-    assert_eq!(bar.close, 185.75, "Wrong close for first bar");
-    assert_eq!(bar.volume, 1000.0, "Wrong volume for first bar");
-    assert_eq!(bar.wap, 185.70, "Wrong WAP for first bar");
-    assert_eq!(bar.count, 100, "Wrong count for first bar");
+    assert_eq!(bar.open, Some(185.50), "Wrong open for first bar");
+    assert_eq!(bar.high, Some(186.00), "Wrong high for first bar");
+    assert_eq!(bar.low, Some(185.25), "Wrong low for first bar");
+    assert_eq!(bar.close, Some(185.75), "Wrong close for first bar");
+    assert_eq!(bar.volume, Some(1000.0), "Wrong volume for first bar");
+    assert_eq!(bar.wap, Some(185.70), "Wrong WAP for first bar");
+    assert_eq!(bar.count, Some(100), "Wrong count for first bar");
 
     // Verify second bar
     let bar = &data.bars[1];
     // 1678890000 = 2023-03-15 14:20:00 UTC
     assert_eq!(bar.date, datetime!(2023-03-15 14:20:00 UTC), "Wrong date for second bar");
-    assert_eq!(bar.open, 185.75, "Wrong open for second bar");
-    assert_eq!(bar.high, 186.25, "Wrong high for second bar");
-    assert_eq!(bar.low, 185.50, "Wrong low for second bar");
-    assert_eq!(bar.close, 186.00, "Wrong close for second bar");
-    assert_eq!(bar.volume, 1500.0, "Wrong volume for second bar");
-    assert_eq!(bar.wap, 185.85, "Wrong WAP for second bar");
-    assert_eq!(bar.count, 150, "Wrong count for second bar");
+    assert_eq!(bar.open, Some(185.75), "Wrong open for second bar");
+    assert_eq!(bar.high, Some(186.25), "Wrong high for second bar");
+    assert_eq!(bar.low, Some(185.50), "Wrong low for second bar");
+    assert_eq!(bar.close, Some(186.00), "Wrong close for second bar");
+    assert_eq!(bar.volume, Some(1500.0), "Wrong volume for second bar");
+    assert_eq!(bar.wap, Some(185.85), "Wrong WAP for second bar");
+    assert_eq!(bar.count, Some(150), "Wrong count for second bar");
 
     assert_eq!(request_message_count(&message_bus), 1);
     assert_request(
@@ -598,15 +598,15 @@ async fn test_historical_data_streaming_with_updates() {
         panic!("Expected Historical variant");
     };
     assert_eq!(data.bars.len(), 1, "Should have 1 initial bar");
-    assert_eq!(data.bars[0].open, 185.50, "Wrong open price");
+    assert_eq!(data.bars[0].open, Some(185.50), "Wrong open price");
 
     // Second: receive streaming update
     let Some(Ok(SubscriptionItem::Data(HistoricalBarUpdate::Update(bar)))) = subscription.next().await else {
         panic!("Expected Update variant");
     };
-    assert_eq!(bar.open, 185.80, "Wrong open price in update");
-    assert_eq!(bar.high, 186.10, "Wrong high price in update");
-    assert_eq!(bar.close, 185.90, "Wrong close price in update");
+    assert_eq!(bar.open, Some(185.80), "Wrong open price in update");
+    assert_eq!(bar.high, Some(186.10), "Wrong high price in update");
+    assert_eq!(bar.close, Some(185.90), "Wrong close price in update");
 
     assert_eq!(request_message_count(&message_bus), 1);
     assert_request(
