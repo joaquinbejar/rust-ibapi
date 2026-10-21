@@ -80,6 +80,7 @@ pub(crate) fn decode_historical_data(server_version: i32, time_zone: &Tz, messag
 
                 bars.push(Bar {
                     date: parse_bar_date(&date, time_zone)?,
+                    time_text: Some(date),
                     open,
                     high,
                     low,
@@ -313,6 +314,7 @@ pub(crate) fn decode_historical_data_update(time_zone: &Tz, message: &mut Respon
 
             Ok(Bar {
                 date: parse_bar_date(&date, time_zone)?,
+                time_text: Some(date),
                 open,
                 high,
                 low,
@@ -418,11 +420,13 @@ pub(crate) fn decode_historical_data_proto(bytes: &[u8], time_zone: &Tz) -> Resu
 
 /// One protobuf bar. Absent fields stay `None`; an absent or unreadable time is
 /// an error, never `UNIX_EPOCH`. The time goes through the text path's
-/// [`parse_bar_date`], so a daily bar's `YYYYMMDD` reads the same on both.
+/// [`parse_bar_date`], so a daily bar's `YYYYMMDD` reads the same on both, and
+/// `time_text` keeps the field as sent, as on the text path.
 fn decode_historical_data_bar(b: &proto::HistoricalDataBar, time_zone: &Tz) -> Result<Bar, Error> {
     let date = b.date.as_deref().ok_or_else(|| Error::parse_proto("date", "bar time is not present"))?;
     Ok(Bar {
         date: parse_bar_date(date, time_zone)?,
+        time_text: Some(date.to_string()),
         open: b.open,
         high: b.high,
         low: b.low,

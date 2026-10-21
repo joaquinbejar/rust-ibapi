@@ -767,6 +767,27 @@ let date: Option<time::Date> = details.contract.last_trade_date; // always None 
 if let Some(text) = details.contract.last_trade_date.as_deref() { /* IB's tag 21, verbatim */ }
 ```
 
+### 32. `Bar.time_text` keeps IB's bar time field
+
+A historical `Bar` has a new field, `time_text: Option<String>`: the bar's time field exactly as IB sent it, before decoding. `Bar.date` is unchanged. `time_text` is set on every bar path (protobuf and text, `HistoricalData` and `HistoricalDataUpdate`) and is never rebuilt from `date`.
+
+`date` cannot tell a calendar date from an instant: IB's `"20261016"` (a daily bar) and the epoch `"1792108800"` both decode to 2026-10-16 00:00:00 UTC. Their `time_text` differs, so a caller that needs to know which one IB stated reads `time_text`.
+
+```rust,ignore
+for bar in &data.bars {
+    match bar.time_text.as_deref() {
+        // Eight characters is a date, the same rule the decoder applies.
+        Some(text) if text.len() == 8 => { /* a date, YYYYMMDD */ }
+        Some(text) => { /* unix seconds, verbatim */ }
+        None => { /* a bar built by hand, not decoded */ }
+    }
+}
+```
+
+What the decoder reads is unchanged: `YYYYMMDD` and unix seconds. A time it cannot read (absent, empty, malformed, or a date-time with a zone such as `"20261016 09:30:00 US/Eastern"`, which the request's `formatDate=2` does not ask for) is still a decode error, so no literal is invented for it. Every decoded bar has `Some`; `None` is only for a `Bar` built by hand.
+
+`Bar` is no longer `Copy`, since it holds a `String`; it is still `Clone`. Code that copied a bar out of a slice (`let bar = data.bars[0];`) borrows it (`&data.bars[0]`) or clones it. A struct literal of `Bar` needs the new field.
+
 ## Before / after: common subscription patterns
 
 ### Order construction
@@ -1116,7 +1137,7 @@ Distinct from `Error::ConnectionRejected` (handshake-time refusal, above) and th
 5. Replace string compares against `OrderStatus.status` / `OrderState.status` (`== "Filled"`, `.as_str() == "Cancelled"`, etc.) with `OrderStatusKind` variants or the `is_active()` / `is_terminal()` helpers.
 6. Replace `Client::connect_with_callback` / `Client::connect_with_options` / any `ConnectionOptions::default()...` with the corresponding `Client::builder()` chain. Use `connect_with_notice_stream()` if you previously installed `startup_notice_callback`.
 7. (Optional) Adopt `Client::notice_stream()` for runtime-only unrouted notice observability.
-8. Historical data: read `Bar` values and `HistoricalData.start` / `.end` as `Option`, handle `Error::Interrupted` instead of `ConnectionReset` / `UnexpectedEndOfStream` from one-shot requests, and use `.send()` for a request id, a timeout or a cancel (see section 30).
+8. Historical data: read `Bar` values and `HistoricalData.start` / `.end` as `Option`, handle `Error::Interrupted` instead of `ConnectionReset` / `UnexpectedEndOfStream` from one-shot requests, and use `.send()` for a request id, a timeout or a cancel (see section 30). Read `Bar.time_text` to tell a daily bar's date from an epoch, and borrow or clone bars, which are no longer `Copy` (see section 32).
 9. Re-run `cargo fmt`, `cargo clippy --all-targets --all-features -- -D warnings`, and your test suite for each feature flag you support.
 
 ## Need help?

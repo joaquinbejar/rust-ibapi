@@ -601,7 +601,7 @@ fn test_text_bar_with_empty_values_keeps_them_absent() {
     let mut message = text_historical_data(&["1681133400", "", "", "", "", "", "", ""]);
     let data = decode_historical_data(server_versions::HISTORICAL_DATA_END, UTC, &mut message).expect("decodes");
 
-    let bar = data.bars[0];
+    let bar = &data.bars[0];
     assert_eq!(bar.date, datetime!(2023-04-10 13:30:00 UTC));
     assert_eq!(
         (bar.open, bar.high, bar.low, bar.close, bar.volume, bar.wap, bar.count),
@@ -616,7 +616,7 @@ fn test_text_bar_keeps_stated_zero_and_negative_values() {
     let mut message = text_historical_data(&["1681133400", "0", "0.0", "0", "0", "-1", "-1", "-1"]);
     let data = decode_historical_data(server_versions::HISTORICAL_DATA_END, UTC, &mut message).expect("decodes");
 
-    let bar = data.bars[0];
+    let bar = &data.bars[0];
     assert_eq!(bar.open, Some(0.0));
     assert_eq!(bar.high, Some(0.0));
     assert_eq!(bar.close, Some(0.0));
@@ -656,7 +656,7 @@ fn test_proto_bar_with_absent_values_keeps_them_absent() {
     });
     let data = decode_historical_data(server_versions::PROTOBUF_HISTORICAL_DATA, UTC, &mut message).expect("decodes");
 
-    let bar = data.bars[0];
+    let bar = &data.bars[0];
     assert_eq!(bar.date, datetime!(2023-04-10 13:30:00 UTC));
     assert_eq!(
         (bar.open, bar.high, bar.low, bar.close, bar.volume, bar.wap, bar.count),
@@ -676,7 +676,7 @@ fn test_proto_bar_keeps_stated_values() {
     });
     let data = decode_historical_data(server_versions::PROTOBUF_HISTORICAL_DATA, UTC, &mut message).expect("decodes");
 
-    let bar = data.bars[0];
+    let bar = &data.bars[0];
     assert_eq!(bar.open, Some(0.0));
     assert_eq!(bar.high, Some(186.00));
     assert_eq!(bar.low, Some(185.00));
@@ -737,4 +737,108 @@ fn test_data_message_alone_states_no_window_on_either_path() {
         (None, None),
         "protobuf: the window is the end marker's, not now_utc()"
     );
+}
+
+// === Bar time literal: the time field as IB sent it ===
+
+/// Decodes one bar whose time field is `time` on all four bar paths: text and
+/// protobuf, data message and streaming update.
+fn decode_bar_on_every_path(time: &str, time_zone: &Tz) -> Vec<(&'static str, Result<Bar, Error>)> {
+    let fields = [time, "1", "1", "1", "1", "1", "1", "1"];
+
+    let mut text = text_historical_data(&fields);
+    let text_bars = decode_historical_data(server_versions::HISTORICAL_DATA_END, time_zone, &mut text).map(|data| data.bars[0].clone());
+
+    let mut text_update = ResponseMessage::from(format!("90\09000\0-1\0{}\0", fields.join("\0")).as_str());
+    let text_update = decode_historical_data_update(time_zone, &mut text_update);
+
+    let bar = crate::proto::HistoricalDataBar {
+        date: Some(time.to_string()),
+        ..full_proto_bar()
+    };
+    let mut proto = proto_historical_data(bar.clone());
+    let proto_bars = decode_historical_data(server_versions::PROTOBUF_HISTORICAL_DATA, time_zone, &mut proto).map(|data| data.bars[0].clone());
+
+    let mut proto_update = proto_historical_data_update(bar);
+    let proto_update = decode_historical_data_update(time_zone, &mut proto_update);
+
+    vec![
+        ("text data", text_bars),
+        ("text update", text_update),
+        ("protobuf data", proto_bars),
+        ("protobuf update", proto_update),
+    ]
+}
+
+fn proto_historical_data_update(bar: crate::proto::HistoricalDataBar) -> ResponseMessage {
+    use prost::Message;
+    let proto_msg = crate::proto::HistoricalDataUpdate {
+        req_id: Some(9000),
+        historical_data_bar: Some(bar),
+    };
+    let mut bytes = Vec::new();
+    proto_msg.encode(&mut bytes).unwrap();
+    ResponseMessage::from_protobuf(
+        IncomingMessages::HistoricalDataUpdate as i32,
+        bytes,
+        server_versions::PROTOBUF_HISTORICAL_DATA,
+    )
+}
+
+#[test]
+fn test_bar_keeps_a_date_literal_on_every_path() {
+    for (path, bar) in decode_bar_on_every_path("20261016", UTC) {
+        let bar = bar.unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(bar.date, datetime!(2026-10-16 0:00:00 UTC), "{path}");
+        assert_eq!(bar.time_text.as_deref(), Some("20261016"), "{path}");
+    }
+}
+
+#[test]
+fn test_bar_keeps_an_epoch_literal_on_every_path() {
+    let new_york: &Tz = time_tz::timezones::db::america::NEW_YORK;
+    for (path, bar) in decode_bar_on_every_path("1681133400", new_york) {
+        let bar = bar.unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(bar.date, datetime!(2023-04-10 13:30:00 UTC), "{path}");
+        assert_eq!(bar.time_text.as_deref(), Some("1681133400"), "{path}");
+    }
+}
+
+#[test]
+fn test_bar_at_midnight_utc_epoch_is_told_apart_from_a_date() {
+    // Negative control: 1792108800 is 2026-10-16 00:00:00 UTC, so `date` is the
+    // same as for "20261016" and cannot tell them apart. Only `time_text` can; a
+    // literal recomposed from `date` would make both bars equal.
+    let dates = decode_bar_on_every_path("20261016", UTC);
+    let epochs = decode_bar_on_every_path("1792108800", UTC);
+    for ((path, date_bar), (_, epoch_bar)) in dates.into_iter().zip(epochs) {
+        let (date_bar, epoch_bar) = (date_bar.expect(path), epoch_bar.expect(path));
+        assert_eq!(date_bar.date, epoch_bar.date, "{path}: both are midnight UTC");
+        assert_eq!(date_bar.time_text.as_deref(), Some("20261016"), "{path}");
+        assert_eq!(epoch_bar.time_text.as_deref(), Some("1792108800"), "{path}");
+        assert_ne!(date_bar, epoch_bar, "{path}: a date and an epoch are different bars");
+    }
+}
+
+#[test]
+fn test_bar_time_literal_is_the_bytes_sent_not_a_recomposition() {
+    // Negative control: "01681133400" decodes to the same instant as
+    // "1681133400"; a literal rebuilt from `date` would drop the leading zero.
+    for (path, bar) in decode_bar_on_every_path("01681133400", UTC) {
+        let bar = bar.unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(bar.date, datetime!(2023-04-10 13:30:00 UTC), "{path}");
+        assert_eq!(bar.time_text.as_deref(), Some("01681133400"), "{path}");
+    }
+}
+
+#[test]
+fn test_bar_with_a_zoned_datetime_or_malformed_time_is_still_an_error() {
+    // The decoder reads only `YYYYMMDD` and unix seconds (the request asks for
+    // formatDate 2). A datetime with a zone, like any other unreadable time,
+    // stays a decode error: no bar, so no literal is invented for it.
+    for time in ["20261016 09:30:00 US/Eastern", "", "yesterday", "2026-10-16", "99999999999999999999"] {
+        for (path, bar) in decode_bar_on_every_path(time, UTC) {
+            assert!(bar.is_err(), "{path}: bar time {time:?} must not decode, got {bar:?}");
+        }
+    }
 }
