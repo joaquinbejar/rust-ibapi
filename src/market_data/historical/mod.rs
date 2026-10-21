@@ -66,11 +66,16 @@ pub enum HistoricalParseError {
 /// `MIDPOINT`). A bar whose time is absent or unreadable is not a bar: the
 /// decoder fails instead of inventing one.
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
-#[derive(Clone, Debug, PartialEq, Copy, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Bar {
     /// The bar's start time, as IB stated it (a date for daily and longer bars,
     /// at midnight UTC; an instant in the session's time zone otherwise).
     pub date: OffsetDateTime,
+    /// The bar's time field exactly as IB sent it, before decoding: `"20261016"`
+    /// for a date, `"1792108800"` for unix seconds. It tells a date apart from
+    /// an instant that happens to fall at midnight UTC, which [`Bar::date`]
+    /// cannot. Every decoded bar has it; `None` only on a bar built by hand.
+    pub time_text: Option<String>,
     /// The bar's open price, `None` when IB left it out.
     pub open: Option<f64>,
     /// The bar's high price, `None` when IB left it out.

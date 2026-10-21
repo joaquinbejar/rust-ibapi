@@ -208,7 +208,7 @@ async fn main() {
 }
 ```
 
-The window (`start`, `end`) and each bar's values are `Option`: `None` when IB did not state them. For the request id, a timeout or a cancel, use `.send()` instead of `.fetch()`; see [migration section 30](docs/migration-3.0.md#30-historical-data-absent-values-ibs-own-window-one-request-per-call).
+The window (`start`, `end`) and each bar's values are `Option`: `None` when IB did not state them. For the request id, a timeout or a cancel, use `.send()` instead of `.fetch()`; see [migration section 30](docs/migration-3.0.md#30-historical-data-absent-values-ibs-own-window-one-request-per-call). Each bar's `time_text` is its time field exactly as IB sent it, so a date (`"20261016"`) can be told apart from an epoch at midnight UTC; see [migration section 32](docs/migration-3.0.md#32-bartime_text-keeps-ibs-bar-time-field).
 
 ### Requesting Realtime Market Data
 
