@@ -244,11 +244,23 @@ pub(crate) fn decode_account_portfolio_value(server_version: i32, message: &mut 
 }
 
 pub(crate) fn decode_account_update_time(message: &mut ResponseMessage) -> Result<AccountUpdateTime, Error> {
-    message.skip(); // message type
-    message.skip(); // version
+    message.decode_proto_or_text(decode_account_update_time_proto, |msg| {
+        msg.skip(); // message type
+        msg.skip(); // version
 
+        Ok(AccountUpdateTime {
+            timestamp: msg.next_string()?,
+        })
+    })
+}
+
+// Gateways that speak protobuf send the update time as protobuf too; decoding
+// it as text fails and the failure ends the account updates stream before its
+// end marker.
+pub(crate) fn decode_account_update_time_proto(bytes: &[u8]) -> Result<AccountUpdateTime, Error> {
+    let p = proto::AccountUpdateTime::decode(bytes)?;
     Ok(AccountUpdateTime {
-        timestamp: message.next_string()?,
+        timestamp: p.time_stamp.unwrap_or_default(),
     })
 }
 

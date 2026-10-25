@@ -911,6 +911,21 @@ fn test_decode_account_update_time_success() {
 }
 
 #[test]
+fn test_decode_account_update_time_proto() {
+    use prost::Message;
+
+    let proto_msg = crate::proto::AccountUpdateTime {
+        time_stamp: Some("12:34".to_owned()),
+    };
+    let mut bytes = Vec::new();
+    proto_msg.encode(&mut bytes).unwrap();
+
+    let result = super::decode_account_update_time_proto(&bytes).unwrap();
+
+    assert_eq!(result.timestamp, "12:34", "Timestamp mismatch");
+}
+
+#[test]
 fn test_decode_position_proto() {
     use prost::Message;
 
